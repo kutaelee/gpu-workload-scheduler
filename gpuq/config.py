@@ -94,7 +94,7 @@ class Config:
             process_scan_interval_seconds=float(raw.get("process_scan_interval_seconds", 15.0)),
             cancel_grace_seconds=float(raw.get("cancel_grace_seconds", 30.0)),
             terminate_grace_seconds=float(raw.get("terminate_grace_seconds", 10.0)),
-            post_job_cooldown_seconds=float(raw.get("post_job_cooldown_seconds", 15.0)),
+            post_job_cooldown_seconds=float(raw.get("post_job_cooldown_seconds", 2.0)),
             wsl_force_terminate=bool(raw.get("wsl_force_terminate", False)),
             cleanup_commands=cleanup_commands,
             external_workloads=external_workloads,

@@ -34,7 +34,7 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
     scheduler.config = SimpleNamespace(
         cancel_grace_seconds=30.0,
         terminate_grace_seconds=10.0,
-        post_job_cooldown_seconds=15.0,
+        post_job_cooldown_seconds=2.0,
         wsl_force_terminate=wsl_force_terminate,
         cleanup_commands=cleanup_commands or {},
     )
@@ -113,4 +113,4 @@ def test_terminal_failure_runs_cleanup_once_and_pauses_admission(monkeypatch):
     assert transitioned is True
     assert record.cleanup_attempted is True
     assert calls[0][1]["status"] == "failed"
-    assert scheduler.admission_not_before_monotonic == 115.0
+    assert scheduler.admission_not_before_monotonic == 102.0

@@ -64,7 +64,7 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
         poll_seconds = 2.0
         cancel_grace_seconds = 30.0
         terminate_grace_seconds = 10.0
-        post_job_cooldown_seconds = 15.0
+        post_job_cooldown_seconds = 2.0
         wsl_force_terminate = $false
     } | ConvertTo-Json
     Write-Utf8NoBom $ConfigPath $configContent

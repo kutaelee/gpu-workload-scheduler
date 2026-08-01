@@ -23,8 +23,8 @@ one exact argv allowlist entry. API clients cannot provide cleanup commands;
 the scheduler runs the configured argv without a shell after cancel or timeout.
 
 After any job reaches a terminal state, admission pauses for a short configurable
-cooldown (15 seconds by default). Failed and canceled jobs run their allowlisted
-cleanup once before the queue admits replacement work.
+cooldown (2 seconds by default, one telemetry cycle). Failed and canceled jobs
+run their allowlisted cleanup once before the queue admits replacement work.
 
 ComfyUI's standard `E:\AI\Apps\ComfyUI\run-comfyui.ps1` starts only the
 lightweight loopback UI server. Its local GPUQ bridge admits each `/prompt` and
