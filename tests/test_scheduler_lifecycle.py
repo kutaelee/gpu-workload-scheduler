@@ -9,6 +9,7 @@ from gpuq.scheduler import RunningProcess, Scheduler
 
 class FakeProcess:
     def __init__(self, exit_code=None):
+        self.pid = 4242
         self.exit_code = exit_code
         self.signals = []
         self.terminated = 0
@@ -52,6 +53,7 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
     scheduler.gpu_process_scan_generation = 0
     scheduler.config = SimpleNamespace(
         gpu_telemetry_enabled=True,
+        poll_seconds=2.0,
         cancel_grace_seconds=30.0,
         terminate_grace_seconds=10.0,
         post_job_cooldown_seconds=2.0,
@@ -172,6 +174,43 @@ def test_terminal_process_is_reaped_without_gpu_telemetry(monkeypatch):
     assert transitioned is True
     assert calls[0][1]["status"] == "failed"
     assert scheduler.running == {}
+
+
+def test_scheduler_reaps_terminal_process_before_any_gpu_probe(monkeypatch):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.running = {"job-terminal": make_record(FakeProcess(exit_code=0))}
+    scheduler.database = SimpleNamespace(
+        get_job=lambda _job_id: {
+            "cancel_requested": False,
+            "peak_total_gpu_used_mb": 9000,
+        },
+        update_peak=lambda *_args: None,
+        mark_finished=lambda *_args, **_kwargs: None,
+        set_state=lambda *_args, **_kwargs: None,
+    )
+    scheduler.snapshot = lambda: {}
+
+    class OneIterationStop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _seconds):
+            self.stopped = True
+
+    scheduler.stop_event = OneIterationStop()
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("terminal transition must precede GPU probe")
+        ),
+    )
+
+    scheduler._loop()
+
+    assert scheduler.running == {}
+    assert scheduler.last_decision == "post-job-no-touch"
 
 
 def test_configured_workload_latches_same_boot_reboot_boundary(
@@ -332,6 +371,53 @@ def test_fatal_gpu_loss_is_persistently_latched(monkeypatch, tmp_path):
     }
 
 
+def test_gpu_query_timeout_is_fatal_during_reboot_boundary_workload(
+    monkeypatch, tmp_path
+):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.fault_state_path = tmp_path / "gpu-fault-state.json"
+    scheduler.provenance = {"git_commit": "test"}
+    scheduler.persisted_fault = None
+    scheduler.transient_failure_backoff_index = 0
+    scheduler._last_gpu_health_log_signature = None
+    scheduler.config.log_root = tmp_path
+    scheduler.config.reboot_boundary_workloads = frozenset({"training-job"})
+    scheduler.running = {"job-protected": make_record(FakeProcess())}
+
+    scheduler._record_gpu_failure(
+        __import__("subprocess").TimeoutExpired("nvidia-smi", 10)
+    )
+
+    state = json.loads(scheduler.fault_state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "reboot_required"
+    assert scheduler.gpu_fault_status == "reboot_required"
+    assert scheduler.next_gpu_probe_monotonic == float("inf")
+
+
+def test_boundary_write_failure_still_latches_current_daemon(monkeypatch, tmp_path):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.workload_boundary_state_path = tmp_path / "gpu-workload-boundary.json"
+    scheduler.provenance = {"git_commit": "test"}
+    record = make_record(FakeProcess(exit_code=0))
+    monkeypatch.setattr(
+        "gpuq.scheduler.write_fault_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    try:
+        scheduler._arm_workload_reboot_boundary(
+            "job-boundary-write-failed", record, "succeeded"
+        )
+    except OSError:
+        pass
+    else:
+        raise AssertionError("state write failure must propagate")
+
+    assert scheduler.workload_reboot_boundary is not None
+    assert scheduler.workload_reboot_boundary["status"] == "active"
+    assert scheduler.next_gpu_probe_monotonic == float("inf")
+
+
 def test_no_touch_window_blocks_gpu_probe(monkeypatch):
     scheduler, clock = make_scheduler(monkeypatch)
     scheduler.no_touch_until_monotonic = clock.value + 15.0
@@ -416,6 +502,78 @@ def test_same_boot_workload_boundary_prevents_startup_gpu_probe(
     assert started == [True]
     assert scheduler.workload_reboot_boundary is not None
     assert scheduler.last_decision == "workload-reboot-boundary-required"
+
+
+def test_same_boot_armed_workload_boundary_prevents_startup_gpu_probe(
+    monkeypatch, tmp_path
+):
+    runtime = tmp_path / ".runtime"
+    runtime.mkdir()
+    (runtime / "gpu-workload-reboot-boundary.json").write_text(
+        json.dumps(
+            {
+                "status": "armed",
+                "windows_boot_epoch": 123456,
+                "workload_key": "training-job",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = runtime / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(
+        config_path=config_path,
+        gpu_telemetry_enabled=True,
+    )
+    monkeypatch.setattr("gpuq.scheduler.REPO_ROOT", tmp_path)
+    monkeypatch.setattr("gpuq.scheduler.windows_boot_epoch", lambda: 123456)
+    monkeypatch.setattr("gpuq.scheduler.runtime_provenance", lambda *_args: {})
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: (_ for _ in ()).throw(AssertionError("must not probe GPU")),
+    )
+    scheduler = Scheduler(config, SimpleNamespace())
+    started = []
+    scheduler.thread = SimpleNamespace(start=lambda: started.append(True))
+
+    scheduler.start()
+
+    assert started == [True]
+    assert scheduler.workload_reboot_boundary["status"] == "armed"
+    assert scheduler.last_decision == "workload-reboot-boundary-required"
+
+
+def test_reboot_boundary_is_persisted_before_process_launch(monkeypatch, tmp_path):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.workload_boundary_state_path = tmp_path / "gpu-workload-boundary.json"
+    scheduler.provenance = {"git_commit": "test"}
+    scheduler.config.reboot_boundary_workloads = frozenset({"training-job"})
+    observed = []
+
+    def fake_popen(*_args, **_kwargs):
+        observed.append(
+            json.loads(
+                scheduler.workload_boundary_state_path.read_text(encoding="utf-8")
+            )
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr("gpuq.scheduler.subprocess.Popen", fake_popen)
+    scheduler.database = SimpleNamespace(mark_running=lambda *_args, **_kwargs: None)
+    scheduler.config.log_root = tmp_path
+    job = {
+        "id": "job-prearmed",
+        "cwd": str(tmp_path),
+        "argv": ["worker.exe"],
+        "max_runtime_seconds": 600,
+        "workload_key": "training-job",
+    }
+
+    scheduler._launch(job, "head-fits")
+
+    assert observed[0]["status"] == "armed"
+    assert observed[0]["job_id"] == "job-prearmed"
+    assert "job-prearmed" in scheduler.running
 
 
 def test_same_boot_no_touch_transition_survives_daemon_restart(

@@ -107,7 +107,7 @@ class Scheduler:
         self.workload_reboot_boundary = (
             persisted_boundary
             if persisted_boundary
-            and persisted_boundary.get("status") == "active"
+            and persisted_boundary.get("status") in {"active", "armed"}
             and persisted_boundary.get("windows_boot_epoch") == self.boot_epoch
             else None
         )
@@ -290,6 +290,27 @@ class Scheduler:
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
+            # Process lifecycle state is host-local and must be checked before any
+            # NVIDIA query.  Otherwise a process that exited just after the prior
+            # iteration receives one extra nvidia-smi touch before its no-touch or
+            # reboot boundary is armed.
+            try:
+                terminal_transition = self._reap_and_cancel(None)
+                if terminal_transition:
+                    with self.lock:
+                        self.last_decision = "post-job-no-touch"
+                    self.database.set_state("runtime", self.snapshot())
+                    self.stop_event.wait(self.config.poll_seconds)
+                    continue
+            except Exception as exc:
+                # Reaping/persistence failure is safety relevant.  Do not probe the
+                # GPU until a later loop proves lifecycle state can be processed.
+                with self.lock:
+                    self.last_error = f"{type(exc).__name__}: {exc}"[:1000]
+                    self.last_decision = "lifecycle-reap-failed-no-gpu-probe"
+                self.stop_event.wait(self.config.poll_seconds)
+                continue
+
             now_monotonic = time.monotonic()
             probe_block_reason = self._gpu_probe_block_reason(now_monotonic)
 
@@ -396,7 +417,19 @@ class Scheduler:
     def _record_gpu_failure(self, exc: Exception) -> None:
         now = datetime.now(timezone.utc).isoformat()
         error = f"{type(exc).__name__}: {exc}"[:1000]
-        fatal = is_fatal_gpu_error(exc)
+        with self.lock:
+            protected_workload_running = any(
+                self._requires_reboot_boundary(record.workload_key)
+                for record in self.running.values()
+            )
+        # A timeout while a reboot-boundary workload is active is not a normal
+        # observability miss: retrying the NVIDIA stack was part of the prior TDR
+        # escalation sequence.  Latch immediately and let Windows reboot define
+        # the next safe probe boundary.
+        fatal = is_fatal_gpu_error(exc) or (
+            protected_workload_running
+            and isinstance(exc, subprocess.TimeoutExpired)
+        )
         with self.lock:
             self.gpu_healthy = False
             self.gpu_health_consecutive_failures += 1
@@ -753,11 +786,45 @@ class Scheduler:
             "reason": "configured-one-gpu-workload-per-windows-boot",
             "runtime_provenance": self.provenance,
         }
-        write_fault_state(self.workload_boundary_state_path, boundary)
         with self.lock:
             self.workload_reboot_boundary = boundary
             self.last_decision = "workload-reboot-boundary-required"
             self.next_gpu_probe_monotonic = float("inf")
+        write_fault_state(self.workload_boundary_state_path, boundary)
+
+    def _arm_workload_boundary_before_launch(self, job: dict) -> dict | None:
+        """Persist a diagnostic boundary before a high-risk process is started.
+
+        The in-memory boundary remains clear while the current daemon owns the
+        process, allowing bounded telemetry and lifecycle handling.  If the daemon
+        exits, a new instance treats the persisted ``armed`` state as an active
+        same-boot boundary and cannot start or probe another workload.
+        """
+        workload_key = str(job["workload_key"])
+        if not self._requires_reboot_boundary(workload_key):
+            return None
+        boundary = {
+            "schema_version": 1,
+            "status": "armed",
+            "armed_at": datetime.now(timezone.utc).isoformat(),
+            "windows_boot_epoch": self.boot_epoch,
+            "job_id": job["id"],
+            "workload_key": workload_key,
+            "reason": "configured-one-gpu-workload-per-windows-boot",
+            "runtime_provenance": self.provenance,
+        }
+        write_fault_state(self.workload_boundary_state_path, boundary)
+        return boundary
+
+    def _clear_unlaunched_workload_boundary(self, boundary: dict) -> None:
+        write_fault_state(
+            self.workload_boundary_state_path,
+            {
+                **boundary,
+                "status": "cleared-without-launch",
+                "cleared_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     def _request_termination(
         self, job_id: str, record: RunningProcess, status: str
@@ -1101,7 +1168,9 @@ class Scheduler:
         creationflags = 0
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        prepared_boundary = None
         try:
+            prepared_boundary = self._arm_workload_boundary_before_launch(job)
             process = subprocess.Popen(
                 argv,
                 cwd=str(cwd),
@@ -1114,6 +1183,25 @@ class Scheduler:
             )
         except Exception as exc:
             log_handle.close()
+            if prepared_boundary is not None:
+                try:
+                    self._clear_unlaunched_workload_boundary(prepared_boundary)
+                except Exception as boundary_error:
+                    # No child was launched, but inability to clear the persisted
+                    # arm must still fail closed in the current daemon.
+                    failed_boundary = {
+                        **prepared_boundary,
+                        "status": "active",
+                        "reason": "failed-to-clear-prelaunch-boundary",
+                    }
+                    with self.lock:
+                        self.workload_reboot_boundary = failed_boundary
+                        self.last_decision = "workload-reboot-boundary-required"
+                        self.next_gpu_probe_monotonic = float("inf")
+                    self.last_error = (
+                        "Failed to clear prelaunch boundary: "
+                        f"{type(boundary_error).__name__}: {boundary_error}"
+                    )[:1000]
             self.database.mark_finished(
                 job["id"],
                 status="failed",

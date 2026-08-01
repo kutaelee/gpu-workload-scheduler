@@ -38,6 +38,10 @@ boundary. When one reaches any terminal state, GPUQ persists the job and boot
 epoch in `.runtime/gpu-workload-reboot-boundary.json`, stops all further
 NVIDIA queries, and blocks admission for the rest of that Windows boot. The
 latch clears only by observing a later boot; daemon restart cannot bypass it.
+The boundary is first persisted as `armed` immediately before process launch;
+a daemon that restarts while the process is running treats that state as an
+active same-boot boundary. Process exit is checked before every NVIDIA query,
+so the terminal transition starts without one final telemetry touch.
 GPUQ deliberately does not run `wsl --terminate` automatically because a
 shared distro can contain unrelated services. Use this allowlist only while a
 driver/GPU-PV handoff fault is under diagnosis, or for workloads that require
@@ -60,6 +64,8 @@ restart. A later boot remains `rearm_required` until an authenticated manual
 rearm confirms a changed boot epoch, no current-boot nvlddmkm 14/153 events,
 and one successful GPU query. State changes are appended without commands or
 environment data to `E:\Data\GpuScheduler\Logs\gpu-health.jsonl`.
+An NVIDIA query timeout while a configured reboot-boundary workload is still
+running is also fatal: GPUQ does not perform a second query in that boot.
 
 `GET /livez` reports only API-process liveness. `GET /readyz` and the legacy
 `GET /api/health` report admission readiness and return HTTP 503 while the GPU
