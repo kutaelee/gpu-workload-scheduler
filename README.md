@@ -7,6 +7,13 @@ starvation, and penalizes recent per-agent VRAM-seconds. The incident-diagnostic
 default is strict serialization (`max_parallel_jobs=1`); parallel backfill is
 not enabled by the installer.
 
+The daemon is demand-driven by default. It does not call `nvidia-smi` merely
+because the service started or while the queue and managed-process set are both
+empty. A queued admission request starts the bounded health-sample sequence;
+an active managed process is sampled at most every 10 seconds. This preserves
+GPUQ ownership and fail-closed admission without turning idle/cooldown periods
+into continuous NVIDIA driver probes.
+
 The Local Knowledge Portal can request a managed job stop and reorder queued
 jobs. A stop is cooperative first (Ctrl+Break). Native jobs then use bounded
 terminate/kill escalation. WSL jobs are not force-terminated unless an
@@ -80,7 +87,7 @@ is blocked, in no-touch transition, or awaiting manual rearm. Runtime status
 also records the Git commit/branch, dirty-worktree flag, config SHA-256, service
 start time, and Windows boot epoch.
 
-For post-incident analysis, a 10-second rolling sample of temperature, power
+While a managed workload or transition gate is active, a 10-second rolling sample of temperature, power
 draw/limit, graphics and memory clocks, PCIe generation/width, VRAM,
 utilization, and driver version is appended to daily
 `gpu-telemetry-YYYYMMDD.jsonl` files in the same log directory. These records

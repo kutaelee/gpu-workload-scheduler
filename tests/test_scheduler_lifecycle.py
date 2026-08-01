@@ -53,7 +53,10 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
     scheduler.gpu_process_scan_generation = 0
     scheduler.config = SimpleNamespace(
         gpu_telemetry_enabled=True,
+        probe_gpu_on_startup=False,
         poll_seconds=2.0,
+        active_gpu_probe_interval_seconds=10.0,
+        fairness_window_minutes=60,
         cancel_grace_seconds=30.0,
         terminate_grace_seconds=10.0,
         post_job_cooldown_seconds=2.0,
@@ -212,6 +215,102 @@ def test_scheduler_reaps_terminal_process_before_any_gpu_probe(monkeypatch):
 
     assert scheduler.running == {}
     assert scheduler.last_decision == "post-job-no-touch"
+
+
+def test_idle_scheduler_does_not_probe_gpu(monkeypatch):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.database = SimpleNamespace(
+        active_jobs=lambda: [],
+        queue_candidates=lambda _window: [],
+        set_state=lambda *_args, **_kwargs: None,
+    )
+    scheduler.snapshot = lambda: {}
+
+    class OneIterationStop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _seconds):
+            self.stopped = True
+
+    scheduler.stop_event = OneIterationStop()
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("idle scheduler must not probe GPU")
+        ),
+    )
+
+    scheduler._loop()
+
+    assert scheduler.last_decision == "idle-no-gpu-probe"
+
+
+def test_queued_job_requests_bounded_gpu_probe(monkeypatch):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.gpu_healthy = False
+    scheduler.gpu_fault_status = "unprobed"
+    scheduler.gpu_health_recovery_successes = 0
+    scheduler.database = SimpleNamespace(
+        active_jobs=lambda: [],
+        queue_candidates=lambda _window: [{"id": "queued-job"}],
+        set_state=lambda *_args, **_kwargs: None,
+    )
+    scheduler.snapshot = lambda: {}
+    probes = []
+
+    class OneIterationStop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _seconds):
+            self.stopped = True
+
+    scheduler.stop_event = OneIterationStop()
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: probes.append(True)
+        or GpuTelemetry("GPU", 32000, 1000, 31000, 0),
+    )
+    scheduler._log_gpu_telemetry = lambda _telemetry: None
+    scheduler._reap_and_cancel = lambda _telemetry: False
+
+    scheduler._loop()
+
+    assert probes == [True]
+    assert scheduler.last_decision == "gpu-health-recovering:1/3"
+
+
+def test_startup_can_defer_first_gpu_probe(monkeypatch, tmp_path):
+    runtime = tmp_path / ".runtime"
+    runtime.mkdir()
+    config_path = runtime / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(
+        config_path=config_path,
+        gpu_telemetry_enabled=True,
+        probe_gpu_on_startup=False,
+    )
+    monkeypatch.setattr("gpuq.scheduler.REPO_ROOT", tmp_path)
+    monkeypatch.setattr("gpuq.scheduler.windows_boot_epoch", lambda: 123456)
+    monkeypatch.setattr("gpuq.scheduler.runtime_provenance", lambda *_args: {})
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: (_ for _ in ()).throw(AssertionError("must defer GPU probe")),
+    )
+    scheduler = Scheduler(config, SimpleNamespace())
+    started = []
+    scheduler.thread = SimpleNamespace(start=lambda: started.append(True))
+
+    scheduler.start()
+
+    assert started == [True]
+    assert scheduler.gpu_fault_status == "unprobed"
+    assert scheduler.last_decision == "startup-no-gpu-probe"
 
 
 def test_configured_workload_latches_same_boot_reboot_boundary(
