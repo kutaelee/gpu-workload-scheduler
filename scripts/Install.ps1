@@ -65,6 +65,11 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
         cancel_grace_seconds = 30.0
         terminate_grace_seconds = 10.0
         post_job_cooldown_seconds = 2.0
+        post_high_load_cooldown_seconds = 180.0
+        high_load_min_runtime_seconds = 1800.0
+        high_load_min_peak_used_mb = 24576
+        gpu_health_recovery_samples = 3
+        gpu_telemetry_log_interval_seconds = 10.0
         wsl_force_terminate = $false
     } | ConvertTo-Json
     Write-Utf8NoBom $ConfigPath $configContent

@@ -35,6 +35,11 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
         cancel_grace_seconds=30.0,
         terminate_grace_seconds=10.0,
         post_job_cooldown_seconds=2.0,
+        post_high_load_cooldown_seconds=180.0,
+        high_load_min_runtime_seconds=1800.0,
+        high_load_min_peak_used_mb=24576,
+        gpu_health_recovery_samples=3,
+        gpu_telemetry_log_interval_seconds=10.0,
         wsl_force_terminate=wsl_force_terminate,
         cleanup_commands=cleanup_commands or {},
     )
@@ -114,3 +119,47 @@ def test_terminal_failure_runs_cleanup_once_and_pauses_admission(monkeypatch):
     assert record.cleanup_attempted is True
     assert calls[0][1]["status"] == "failed"
     assert scheduler.admission_not_before_monotonic == 102.0
+
+
+def test_terminal_process_is_reaped_without_gpu_telemetry(monkeypatch):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    process = FakeProcess(exit_code=1)
+    record = make_record(process)
+    scheduler.running = {"job-lost-gpu": record}
+    calls = []
+    scheduler.database = SimpleNamespace(
+        get_job=lambda _job_id: {
+            "cancel_requested": True,
+            "peak_total_gpu_used_mb": 9000,
+        },
+        update_peak=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("peak must not update from missing telemetry")
+        ),
+        mark_finished=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    transitioned = scheduler._reap_and_cancel(None)
+
+    assert transitioned is True
+    assert calls[0][1]["status"] == "failed"
+    assert scheduler.running == {}
+
+
+def test_long_job_uses_high_load_cooldown(monkeypatch):
+    scheduler, clock = make_scheduler(monkeypatch)
+    process = FakeProcess(exit_code=0)
+    record = make_record(process)
+    record.started_monotonic = clock.value - 2000
+    scheduler.running = {"job-long": record}
+    scheduler.database = SimpleNamespace(
+        get_job=lambda _job_id: {
+            "cancel_requested": False,
+            "peak_total_gpu_used_mb": 19000,
+        },
+        update_peak=lambda *_args: None,
+        mark_finished=lambda *_args, **_kwargs: None,
+    )
+
+    scheduler._reap_and_cancel(GpuTelemetry("GPU", 32000, 1000, 31000, 0))
+
+    assert scheduler.admission_not_before_monotonic == 280.0

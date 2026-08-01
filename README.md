@@ -22,9 +22,29 @@ Detached helpers such as Docker-hosted Ollama use the operator-owned
 one exact argv allowlist entry. API clients cannot provide cleanup commands;
 the scheduler runs the configured argv without a shell after cancel or timeout.
 
-After any job reaches a terminal state, admission pauses for a short configurable
-cooldown (2 seconds by default, one telemetry cycle). Failed and canceled jobs
-run their allowlisted cleanup once before the queue admits replacement work.
+After any job reaches a terminal state, admission pauses for a configurable
+cooldown (2 seconds by default). A job that ran for at least 30 minutes or
+reached at least 24 GiB total GPU usage triggers a 180-second high-load
+cooldown. The longer deadline survives intervening short jobs, preventing a
+fresh model load immediately after sustained or near-capacity GPU work. Failed
+and canceled jobs run their allowlisted cleanup once before the queue admits
+replacement work.
+
+GPU telemetry is an admission circuit breaker. If `nvidia-smi` fails or returns
+an invalid row, the dashboard exposes `gpu_health.status=blocked`, hides stale
+VRAM/utilization as current telemetry, and starts no new work. Process reaping
+and cancellation continue without telemetry so a driver failure cannot leave a
+completed wrapper permanently marked as running. Three consecutive good
+samples are required before an in-process recovery may admit work again. State
+changes are appended without commands or environment data to
+`E:\Data\GpuScheduler\Logs\gpu-health.jsonl`. A Windows reboot still takes
+precedence when NVIDIA reports that the GPU is lost.
+
+For post-incident analysis, a 10-second rolling sample of temperature, power
+draw/limit, graphics and memory clocks, PCIe generation/width, VRAM,
+utilization, and driver version is appended to daily
+`gpu-telemetry-YYYYMMDD.jsonl` files in the same log directory. These records
+contain no process command lines or environment values.
 
 ComfyUI's standard `E:\AI\Apps\ComfyUI\run-comfyui.ps1` starts only the
 lightweight loopback UI server. Its local GPUQ bridge admits each `/prompt` and

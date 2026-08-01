@@ -25,6 +25,11 @@ class Config:
     cancel_grace_seconds: float
     terminate_grace_seconds: float
     post_job_cooldown_seconds: float
+    post_high_load_cooldown_seconds: float
+    high_load_min_runtime_seconds: float
+    high_load_min_peak_used_mb: int
+    gpu_health_recovery_samples: int
+    gpu_telemetry_log_interval_seconds: float
     wsl_force_terminate: bool
     cleanup_commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
     external_workloads: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -95,6 +100,21 @@ class Config:
             cancel_grace_seconds=float(raw.get("cancel_grace_seconds", 30.0)),
             terminate_grace_seconds=float(raw.get("terminate_grace_seconds", 10.0)),
             post_job_cooldown_seconds=float(raw.get("post_job_cooldown_seconds", 2.0)),
+            post_high_load_cooldown_seconds=float(
+                raw.get("post_high_load_cooldown_seconds", 180.0)
+            ),
+            high_load_min_runtime_seconds=float(
+                raw.get("high_load_min_runtime_seconds", 1800.0)
+            ),
+            high_load_min_peak_used_mb=int(
+                raw.get("high_load_min_peak_used_mb", 24576)
+            ),
+            gpu_health_recovery_samples=max(
+                1, int(raw.get("gpu_health_recovery_samples", 3))
+            ),
+            gpu_telemetry_log_interval_seconds=max(
+                2.0, float(raw.get("gpu_telemetry_log_interval_seconds", 10.0))
+            ),
             wsl_force_terminate=bool(raw.get("wsl_force_terminate", False)),
             cleanup_commands=cleanup_commands,
             external_workloads=external_workloads,

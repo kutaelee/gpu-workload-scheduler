@@ -55,13 +55,25 @@ class Scheduler:
         self.last_external_scan_monotonic = 0.0
         self.external_workloads: list[dict] = []
         self.admission_not_before_monotonic = 0.0
+        self.gpu_healthy = False
+        self.gpu_health_consecutive_failures = 0
+        self.gpu_health_recovery_successes = 0
+        self.gpu_health_last_failure_at: str | None = None
+        self.gpu_health_last_recovered_at: str | None = None
+        self._last_gpu_health_log_signature: str | None = None
+        self._last_gpu_telemetry_log_monotonic = 0.0
 
     def start(self) -> None:
-        telemetry = read_gpu()
-        self.telemetry = telemetry
-        self.baseline_used_mb = telemetry.used_mb
-        self._refresh_gpu_processes(force=True)
-        self._refresh_external_workloads(force=True)
+        try:
+            telemetry = read_gpu()
+        except Exception as exc:
+            self._record_gpu_failure(exc)
+        else:
+            self.telemetry = telemetry
+            self.baseline_used_mb = telemetry.used_mb
+            self.gpu_healthy = True
+            self._refresh_gpu_processes(force=True)
+            self._refresh_external_workloads(force=True)
         self.thread.start()
 
     def stop(self) -> None:
@@ -70,7 +82,8 @@ class Scheduler:
 
     def snapshot(self) -> dict:
         with self.lock:
-            telemetry = self.telemetry.to_dict() if self.telemetry else None
+            last_known_telemetry = self.telemetry.to_dict() if self.telemetry else None
+            telemetry = last_known_telemetry if self.gpu_healthy else None
             managed_pids = {record.process.pid for record in self.running.values()}
             unmanaged_processes = [
                 process.to_dict()
@@ -79,6 +92,23 @@ class Scheduler:
             ]
             return {
                 "gpu": telemetry,
+                "last_known_gpu": last_known_telemetry,
+                "gpu_health": {
+                    "status": (
+                        "healthy"
+                        if self.gpu_healthy
+                        else (
+                            "recovering"
+                            if self.gpu_health_recovery_successes
+                            else "blocked"
+                        )
+                    ),
+                    "consecutive_failures": self.gpu_health_consecutive_failures,
+                    "recovery_successes": self.gpu_health_recovery_successes,
+                    "recovery_samples_required": self.config.gpu_health_recovery_samples,
+                    "last_failure_at": self.gpu_health_last_failure_at,
+                    "last_recovered_at": self.gpu_health_last_recovered_at,
+                },
                 "baseline_used_mb": self.baseline_used_mb,
                 "safety_vram_mb": self.config.safety_vram_mb,
                 "fairness_window_minutes": self.config.fairness_window_minutes,
@@ -96,7 +126,11 @@ class Scheduler:
             }
 
     def scores_for(self, queued: list[dict]) -> dict[str, float]:
-        telemetry = self.telemetry or read_gpu()
+        if not queued:
+            return {}
+        telemetry = self.telemetry
+        if telemetry is None:
+            return {}
         now = datetime.now(timezone.utc)
         return {
             row["id"]: round(
@@ -115,9 +149,26 @@ class Scheduler:
         while not self.stop_event.is_set():
             try:
                 telemetry = read_gpu()
-                with self.lock:
-                    self.telemetry = telemetry
-                    self.last_error = None
+            except Exception as exc:
+                self._record_gpu_failure(exc)
+                # A lost GPU must block admission, but process lifecycle still
+                # needs to advance so exited/canceled jobs do not remain stuck
+                # as running merely because telemetry is unavailable.
+                self._reap_and_cancel(None)
+                try:
+                    self.database.set_state("runtime", self.snapshot())
+                except Exception as state_exc:
+                    with self.lock:
+                        self.last_error = (
+                            f"{self.last_error}; state persistence failed: "
+                            f"{type(state_exc).__name__}: {state_exc}"
+                        )[:1000]
+                self.stop_event.wait(self.config.poll_seconds)
+                continue
+
+            try:
+                recovered = self._record_gpu_success(telemetry)
+                self._log_gpu_telemetry(telemetry)
                 self._refresh_gpu_processes()
                 self._refresh_external_workloads()
                 terminal_transition = self._reap_and_cancel(telemetry)
@@ -127,13 +178,98 @@ class Scheduler:
                 if terminal_transition:
                     with self.lock:
                         self.last_decision = "post-job-cooldown"
+                elif not self.gpu_healthy:
+                    with self.lock:
+                        self.last_decision = (
+                            "gpu-health-recovering:"
+                            f"{self.gpu_health_recovery_successes}/"
+                            f"{self.config.gpu_health_recovery_samples}"
+                        )
                 else:
+                    if recovered:
+                        self._pause_admission()
                     self._schedule_once(telemetry, active_rows)
                 self.database.set_state("runtime", self.snapshot())
             except Exception as exc:
                 with self.lock:
-                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    self.last_error = f"{type(exc).__name__}: {exc}"[:1000]
             self.stop_event.wait(self.config.poll_seconds)
+
+    def _record_gpu_failure(self, exc: Exception) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        error = f"{type(exc).__name__}: {exc}"[:1000]
+        with self.lock:
+            self.gpu_healthy = False
+            self.gpu_health_consecutive_failures += 1
+            self.gpu_health_recovery_successes = 0
+            self.gpu_health_last_failure_at = now
+            self.last_decision = "gpu-health-blocked"
+            self.last_error = error
+        self._log_gpu_health_event("blocked", error)
+
+    def _record_gpu_success(self, telemetry: GpuTelemetry) -> bool:
+        recovered = False
+        with self.lock:
+            self.telemetry = telemetry
+            if self.gpu_healthy:
+                self.last_error = None
+                return False
+            self.gpu_health_recovery_successes += 1
+            if (
+                self.gpu_health_recovery_successes
+                >= self.config.gpu_health_recovery_samples
+            ):
+                self.gpu_healthy = True
+                self.gpu_health_consecutive_failures = 0
+                self.gpu_health_recovery_successes = 0
+                self.gpu_health_last_recovered_at = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                self.last_error = None
+                recovered = True
+        if recovered:
+            self._log_gpu_health_event("recovered", None)
+        return recovered
+
+    def _log_gpu_health_event(self, status: str, error: str | None) -> None:
+        signature = f"{status}:{error or ''}"
+        if signature == self._last_gpu_health_log_signature:
+            return
+        self._last_gpu_health_log_signature = signature
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "error": error,
+            "consecutive_failures": self.gpu_health_consecutive_failures,
+        }
+        try:
+            self.config.log_root.mkdir(parents=True, exist_ok=True)
+            with (self.config.log_root / "gpu-health.jsonl").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            # Health logging must never bypass the admission circuit breaker.
+            pass
+
+    def _log_gpu_telemetry(self, telemetry: GpuTelemetry) -> None:
+        now_monotonic = time.monotonic()
+        if (
+            now_monotonic - self._last_gpu_telemetry_log_monotonic
+            < self.config.gpu_telemetry_log_interval_seconds
+        ):
+            return
+        self._last_gpu_telemetry_log_monotonic = now_monotonic
+        now = datetime.now(timezone.utc)
+        event = {"timestamp": now.isoformat(), **telemetry.to_dict()}
+        try:
+            self.config.log_root.mkdir(parents=True, exist_ok=True)
+            path = self.config.log_root / f"gpu-telemetry-{now:%Y%m%d}.jsonl"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            # Observability must not interfere with admission or job reaping.
+            pass
 
     def _refresh_gpu_processes(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -237,13 +373,13 @@ class Scheduler:
         self._refresh_external_workloads(force=True)
         return result
 
-    def _reap_and_cancel(self, telemetry: GpuTelemetry) -> bool:
+    def _reap_and_cancel(self, telemetry: GpuTelemetry | None) -> bool:
         terminal_transition = False
         with self.lock:
             running_items = list(self.running.items())
         for job_id, record in running_items:
             job = self.database.get_job(job_id)
-            if job:
+            if job and telemetry is not None:
                 self.database.update_peak(job_id, telemetry.used_mb)
             exit_code = record.process.poll()
             if exit_code is not None:
@@ -269,7 +405,9 @@ class Scheduler:
                     error=error,
                 )
                 self._close_record(job_id)
-                self._pause_admission()
+                self._pause_admission(
+                    self._cooldown_for_terminal_job(job, record, telemetry)
+                )
                 terminal_transition = True
                 continue
             if job and job.get("cancel_requested"):
@@ -377,13 +515,39 @@ class Scheduler:
         if record:
             record.log_handle.close()
 
-    def _pause_admission(self) -> None:
+    def _cooldown_for_terminal_job(
+        self,
+        job: dict | None,
+        record: RunningProcess,
+        telemetry: GpuTelemetry | None,
+    ) -> float:
+        runtime_seconds = max(0.0, time.monotonic() - record.started_monotonic)
+        peak_used_mb = int((job or {}).get("peak_total_gpu_used_mb") or 0)
+        if telemetry is not None:
+            peak_used_mb = max(peak_used_mb, telemetry.used_mb)
+        high_load = (
+            runtime_seconds >= self.config.high_load_min_runtime_seconds
+            or peak_used_mb >= self.config.high_load_min_peak_used_mb
+        )
+        return (
+            self.config.post_high_load_cooldown_seconds
+            if high_load
+            else self.config.post_job_cooldown_seconds
+        )
+
+    def _pause_admission(self, seconds: float | None = None) -> None:
+        if seconds is None:
+            seconds = self.config.post_job_cooldown_seconds
         self.admission_not_before_monotonic = max(
             self.admission_not_before_monotonic,
-            time.monotonic() + self.config.post_job_cooldown_seconds,
+            time.monotonic() + seconds,
         )
 
     def _schedule_once(self, telemetry: GpuTelemetry, active_rows: list[dict]) -> None:
+        if not self.gpu_healthy:
+            with self.lock:
+                self.last_decision = "gpu-health-blocked"
+            return
         cooldown_remaining = self.admission_not_before_monotonic - time.monotonic()
         if cooldown_remaining > 0:
             with self.lock:
