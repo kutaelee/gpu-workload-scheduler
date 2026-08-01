@@ -67,6 +67,7 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
         gpu_telemetry_log_interval_seconds=10.0,
         wsl_force_terminate=wsl_force_terminate,
         reboot_boundary_workloads=frozenset(),
+        reboot_boundary_workload_patterns=(),
         cleanup_commands=cleanup_commands or {},
     )
     clock = SimpleNamespace(value=100.0)
@@ -204,6 +205,43 @@ def test_configured_workload_latches_same_boot_reboot_boundary(
         scheduler._gpu_probe_block_reason(clock.value)
         == "workload-reboot-boundary-required"
     )
+
+
+def test_pattern_matched_workload_latches_same_boot_reboot_boundary(
+    monkeypatch, tmp_path
+):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.workload_boundary_state_path = tmp_path / "gpu-workload-boundary.json"
+    scheduler.provenance = {"git_commit": "test"}
+    scheduler.config.reboot_boundary_workload_patterns = (
+        "wedding-*klein9b*qfloat8*",
+    )
+    process = FakeProcess(exit_code=0)
+    record = make_record(process)
+    record.workload_key = "wedding-v289-klein9b-groom-r64-qfloat8-lora3000"
+    scheduler.running = {"job-pattern-boundary": record}
+    scheduler.database = SimpleNamespace(
+        get_job=lambda _job_id: {
+            "cancel_requested": False,
+            "peak_total_gpu_used_mb": 20000,
+        },
+        update_peak=lambda *_args: None,
+        mark_finished=lambda *_args, **_kwargs: None,
+    )
+
+    scheduler._reap_and_cancel(GpuTelemetry("GPU", 32000, 1000, 31000, 0))
+
+    assert scheduler.workload_reboot_boundary is not None
+    assert scheduler.workload_reboot_boundary["workload_key"] == record.workload_key
+
+
+def test_reboot_boundary_pattern_does_not_match_unrelated_workload(monkeypatch):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.config.reboot_boundary_workload_patterns = (
+        "wedding-*klein9b*qfloat8*",
+    )
+
+    assert scheduler._requires_reboot_boundary("comfyui-prompt") is False
 
 
 def test_runtime_alone_does_not_trigger_high_capacity_transition(monkeypatch):

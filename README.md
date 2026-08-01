@@ -43,6 +43,14 @@ shared distro can contain unrelated services. Use this allowlist only while a
 driver/GPU-PV handoff fault is under diagnosis, or for workloads that require
 an explicit reboot boundary by policy.
 
+`reboot_boundary_workload_patterns` provides the same boundary for an explicit
+set of lowercase shell-style workload-key patterns (`*` and `?`). This prevents
+versioned diagnostic jobs from silently escaping the boundary when only their
+run number or subject suffix changes. Patterns apply to the declared GPUQ
+workload key, never to argv or environment data. Keep them narrow; for example,
+`wedding-*klein9b*qfloat8*` covers the currently isolated Klein 9B qfloat8
+training family without blocking unrelated ComfyUI prompts.
+
 GPU telemetry is an admission circuit breaker. Transient query failures back
 off 5, 15, then 60 seconds while process lifecycle reaping continues without
 touching NVIDIA. Exit code 6, `GPU is lost`, or `reboot required` is different:

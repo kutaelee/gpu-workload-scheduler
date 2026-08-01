@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from .config import REPO_ROOT, Config
@@ -709,7 +710,7 @@ class Scheduler:
                         else self.config.post_job_no_touch_seconds
                     ),
                 )
-                if record.workload_key in self.config.reboot_boundary_workloads:
+                if self._requires_reboot_boundary(record.workload_key):
                     self._arm_workload_reboot_boundary(job_id, record, status)
                 terminal_transition = True
                 continue
@@ -719,6 +720,14 @@ class Scheduler:
             if time.monotonic() - record.started_monotonic > record.max_runtime_seconds:
                 self._request_termination(job_id, record, "timed_out")
         return terminal_transition
+
+    def _requires_reboot_boundary(self, workload_key: str) -> bool:
+        if workload_key in self.config.reboot_boundary_workloads:
+            return True
+        return any(
+            fnmatchcase(workload_key, pattern)
+            for pattern in self.config.reboot_boundary_workload_patterns
+        )
 
     def _arm_workload_reboot_boundary(
         self,
