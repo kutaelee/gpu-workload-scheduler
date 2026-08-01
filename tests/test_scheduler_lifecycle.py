@@ -70,6 +70,7 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
         wsl_force_terminate=wsl_force_terminate,
         reboot_boundary_workloads=frozenset(),
         reboot_boundary_workload_patterns=(),
+        reboot_boundary_exempt_workloads=frozenset(),
         cleanup_commands=cleanup_commands or {},
     )
     clock = SimpleNamespace(value=100.0)
@@ -281,6 +282,25 @@ def test_reboot_boundary_pattern_does_not_match_unrelated_workload(monkeypatch):
     )
 
     assert scheduler._requires_reboot_boundary("comfyui-prompt") is False
+
+
+def test_exact_exemption_overrides_reboot_boundary_pattern(monkeypatch):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    workload = "wedding-v290-klein9b-cpuq-reload-cycle1-qfloat8"
+    scheduler.config.reboot_boundary_workload_patterns = (
+        "wedding-*klein9b*qfloat8*",
+    )
+    scheduler.config.reboot_boundary_exempt_workloads = frozenset({workload})
+
+    assert scheduler._requires_reboot_boundary(workload) is False
+
+
+def test_exact_boundary_still_wins_for_non_exempt_workload(monkeypatch):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.config.reboot_boundary_workloads = frozenset({"legacy-gpuq"})
+    scheduler.config.reboot_boundary_exempt_workloads = frozenset()
+
+    assert scheduler._requires_reboot_boundary("legacy-gpuq") is True
 
 
 def test_runtime_alone_does_not_trigger_high_capacity_transition(monkeypatch):
