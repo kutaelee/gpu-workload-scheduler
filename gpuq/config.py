@@ -38,6 +38,7 @@ class Config:
     gpu_health_recovery_samples: int
     gpu_telemetry_log_interval_seconds: float
     wsl_force_terminate: bool
+    reboot_boundary_workloads: frozenset[str] = field(default_factory=frozenset)
     cleanup_commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
     external_workloads: dict[str, dict[str, str]] = field(default_factory=dict)
 
@@ -93,6 +94,12 @@ class Config:
                     "executable": str(executable_path),
                     "label": label.strip()[:120],
                 }
+        reboot_boundary_workloads = frozenset(
+            workload
+            for workload in (raw.get("reboot_boundary_workloads") or [])
+            if isinstance(workload, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,119}", workload)
+        )
         return cls(
             config_path=path,
             database_url=raw["database_url"],
@@ -147,6 +154,7 @@ class Config:
                 2.0, float(raw.get("gpu_telemetry_log_interval_seconds", 10.0))
             ),
             wsl_force_terminate=bool(raw.get("wsl_force_terminate", False)),
+            reboot_boundary_workloads=reboot_boundary_workloads,
             cleanup_commands=cleanup_commands,
             external_workloads=external_workloads,
         )

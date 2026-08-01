@@ -91,6 +91,9 @@ class Scheduler:
         self.transition_state_path = (
             REPO_ROOT / ".runtime" / "gpu-transition-state.json"
         )
+        self.workload_boundary_state_path = (
+            REPO_ROOT / ".runtime" / "gpu-workload-reboot-boundary.json"
+        )
         self.persisted_fault = read_fault_state(self.fault_state_path)
         self.gpu_fault_status = "starting"
         if self.persisted_fault and self.persisted_fault.get("status") == "reboot_required":
@@ -99,6 +102,14 @@ class Scheduler:
                 if self.persisted_fault.get("windows_boot_epoch") == self.boot_epoch
                 else "rearm_required"
             )
+        persisted_boundary = read_fault_state(self.workload_boundary_state_path)
+        self.workload_reboot_boundary = (
+            persisted_boundary
+            if persisted_boundary
+            and persisted_boundary.get("status") == "active"
+            and persisted_boundary.get("windows_boot_epoch") == self.boot_epoch
+            else None
+        )
         self.provenance = runtime_provenance(REPO_ROOT, config.config_path)
         persisted_transition = read_fault_state(self.transition_state_path)
         if (
@@ -138,6 +149,10 @@ class Scheduler:
             return
         if self.gpu_fault_status in {"reboot_required", "rearm_required"}:
             self.last_decision = f"gpu-{self.gpu_fault_status}"
+            self.thread.start()
+            return
+        if self.workload_reboot_boundary is not None:
+            self.last_decision = "workload-reboot-boundary-required"
             self.thread.start()
             return
         try:
@@ -196,6 +211,7 @@ class Scheduler:
                     in {"reboot_required", "rearm_required"},
                 },
                 "admission_ready": self.admission_ready(),
+                "workload_reboot_boundary": self.workload_reboot_boundary,
                 "runtime_provenance": dict(self.provenance),
                 "baseline_used_mb": self.baseline_used_mb,
                 "safety_vram_mb": self.config.safety_vram_mb,
@@ -222,6 +238,7 @@ class Scheduler:
             self.config.gpu_telemetry_enabled
             and self.gpu_healthy
             and self.gpu_fault_status == "healthy"
+            and self.workload_reboot_boundary is None
             and self.high_load_transition_gate is None
             and time.monotonic() >= self.admission_not_before_monotonic
             and time.monotonic() >= self.no_touch_until_monotonic
@@ -361,6 +378,8 @@ class Scheduler:
             return "telemetry-disabled"
         if self.gpu_fault_status in {"reboot_required", "rearm_required"}:
             return f"gpu-{self.gpu_fault_status}"
+        if self.workload_reboot_boundary is not None:
+            return "workload-reboot-boundary-required"
         if now_monotonic < self.no_touch_until_monotonic:
             return (
                 "post-high-load-no-touch:"
@@ -690,6 +709,8 @@ class Scheduler:
                         else self.config.post_job_no_touch_seconds
                     ),
                 )
+                if record.workload_key in self.config.reboot_boundary_workloads:
+                    self._arm_workload_reboot_boundary(job_id, record, status)
                 terminal_transition = True
                 continue
             if job and job.get("cancel_requested"):
@@ -698,6 +719,36 @@ class Scheduler:
             if time.monotonic() - record.started_monotonic > record.max_runtime_seconds:
                 self._request_termination(job_id, record, "timed_out")
         return terminal_transition
+
+    def _arm_workload_reboot_boundary(
+        self,
+        job_id: str,
+        record: RunningProcess,
+        status: str,
+    ) -> None:
+        """Block all further GPU access until Windows has rebooted.
+
+        This is deliberately a persistent admission/probe latch rather than an
+        automatic ``wsl --terminate``.  A shared WSL distro can contain unrelated
+        long-lived processes, so the scheduler must not destroy that state as an
+        implicit post-job side effect.
+        """
+        boundary = {
+            "schema_version": 1,
+            "status": "active",
+            "latched_at": datetime.now(timezone.utc).isoformat(),
+            "windows_boot_epoch": self.boot_epoch,
+            "job_id": job_id,
+            "workload_key": record.workload_key,
+            "terminal_status": status,
+            "reason": "configured-one-gpu-workload-per-windows-boot",
+            "runtime_provenance": self.provenance,
+        }
+        write_fault_state(self.workload_boundary_state_path, boundary)
+        with self.lock:
+            self.workload_reboot_boundary = boundary
+            self.last_decision = "workload-reboot-boundary-required"
+            self.next_gpu_probe_monotonic = float("inf")
 
     def _request_termination(
         self, job_id: str, record: RunningProcess, status: str

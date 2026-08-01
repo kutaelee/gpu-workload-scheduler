@@ -35,6 +35,8 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
     scheduler.admission_not_before_monotonic = 0.0
     scheduler.high_load_transition_gate = None
     scheduler.transition_state_path = None
+    scheduler.workload_boundary_state_path = None
+    scheduler.workload_reboot_boundary = None
     scheduler.boot_epoch = 123456
     scheduler.no_touch_until_monotonic = 0.0
     scheduler.next_gpu_probe_monotonic = 0.0
@@ -64,6 +66,7 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
         gpu_health_recovery_samples=3,
         gpu_telemetry_log_interval_seconds=10.0,
         wsl_force_terminate=wsl_force_terminate,
+        reboot_boundary_workloads=frozenset(),
         cleanup_commands=cleanup_commands or {},
     )
     clock = SimpleNamespace(value=100.0)
@@ -168,6 +171,39 @@ def test_terminal_process_is_reaped_without_gpu_telemetry(monkeypatch):
     assert transitioned is True
     assert calls[0][1]["status"] == "failed"
     assert scheduler.running == {}
+
+
+def test_configured_workload_latches_same_boot_reboot_boundary(
+    monkeypatch, tmp_path
+):
+    scheduler, clock = make_scheduler(monkeypatch)
+    scheduler.workload_boundary_state_path = tmp_path / "gpu-workload-boundary.json"
+    scheduler.provenance = {"git_commit": "test"}
+    scheduler.config.reboot_boundary_workloads = frozenset({"training-job"})
+    process = FakeProcess(exit_code=0)
+    scheduler.running = {"job-boundary": make_record(process)}
+    scheduler.database = SimpleNamespace(
+        get_job=lambda _job_id: {
+            "cancel_requested": False,
+            "peak_total_gpu_used_mb": 20000,
+        },
+        update_peak=lambda *_args: None,
+        mark_finished=lambda *_args, **_kwargs: None,
+    )
+
+    scheduler._reap_and_cancel(GpuTelemetry("GPU", 32000, 1000, 31000, 0))
+
+    state = json.loads(
+        scheduler.workload_boundary_state_path.read_text(encoding="utf-8")
+    )
+    assert state["workload_key"] == "training-job"
+    assert state["windows_boot_epoch"] == 123456
+    assert scheduler.workload_reboot_boundary == state
+    assert scheduler.admission_ready() is False
+    assert (
+        scheduler._gpu_probe_block_reason(clock.value)
+        == "workload-reboot-boundary-required"
+    )
 
 
 def test_runtime_alone_does_not_trigger_high_capacity_transition(monkeypatch):
@@ -303,6 +339,45 @@ def test_same_boot_fatal_latch_prevents_startup_gpu_probe(monkeypatch, tmp_path)
     assert started == [True]
     assert scheduler.gpu_fault_status == "reboot_required"
     assert scheduler.gpu_healthy is False
+
+
+def test_same_boot_workload_boundary_prevents_startup_gpu_probe(
+    monkeypatch, tmp_path
+):
+    runtime = tmp_path / ".runtime"
+    runtime.mkdir()
+    (runtime / "gpu-workload-reboot-boundary.json").write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "windows_boot_epoch": 123456,
+                "workload_key": "training-job",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = runtime / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(
+        config_path=config_path,
+        gpu_telemetry_enabled=True,
+    )
+    monkeypatch.setattr("gpuq.scheduler.REPO_ROOT", tmp_path)
+    monkeypatch.setattr("gpuq.scheduler.windows_boot_epoch", lambda: 123456)
+    monkeypatch.setattr("gpuq.scheduler.runtime_provenance", lambda *_args: {})
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: (_ for _ in ()).throw(AssertionError("must not probe GPU")),
+    )
+    scheduler = Scheduler(config, SimpleNamespace())
+    started = []
+    scheduler.thread = SimpleNamespace(start=lambda: started.append(True))
+
+    scheduler.start()
+
+    assert started == [True]
+    assert scheduler.workload_reboot_boundary is not None
+    assert scheduler.last_decision == "workload-reboot-boundary-required"
 
 
 def test_same_boot_no_touch_transition_survives_daemon_restart(

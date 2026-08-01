@@ -33,6 +33,16 @@ waiting a fixed 180 seconds. Any failed query, renewed utilization, excess
 resident VRAM, or changed process census resets the evidence. Failed and
 canceled jobs still run their allowlisted cleanup once.
 
+Workloads listed in `reboot_boundary_workloads` use a stricter diagnostic
+boundary. When one reaches any terminal state, GPUQ persists the job and boot
+epoch in `.runtime/gpu-workload-reboot-boundary.json`, stops all further
+NVIDIA queries, and blocks admission for the rest of that Windows boot. The
+latch clears only by observing a later boot; daemon restart cannot bypass it.
+GPUQ deliberately does not run `wsl --terminate` automatically because a
+shared distro can contain unrelated services. Use this allowlist only while a
+driver/GPU-PV handoff fault is under diagnosis, or for workloads that require
+an explicit reboot boundary by policy.
+
 GPU telemetry is an admission circuit breaker. Transient query failures back
 off 5, 15, then 60 seconds while process lifecycle reaping continues without
 touching NVIDIA. Exit code 6, `GPU is lost`, or `reboot required` is different:
