@@ -9,9 +9,10 @@ from gpuq.server import ApiServer, Handler
 class FakeScheduler:
     def __init__(self):
         self.stopped_external: list[str] = []
+        self.ready = True
 
     def snapshot(self):
-        return {"managed_running": 0}
+        return {"managed_running": 0, "admission_ready": self.ready}
 
     def scores_for(self, _queued):
         return {}
@@ -21,6 +22,9 @@ class FakeScheduler:
         if key != "portal-ollama":
             return None
         return {"key": key, "state": "idle", "models": []}
+
+    def rearm_gpu(self):
+        return {"rearmed": False, "reason": "windows-reboot-required"}
 
 
 class FakeDatabase:
@@ -48,6 +52,16 @@ def post(server: ApiServer, path: str, payload: dict, token: str | None):
     connection = HTTPConnection(*server.server_address, timeout=2)
     try:
         connection.request("POST", path, body=body, headers=headers)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+def get(server: ApiServer, path: str):
+    connection = HTTPConnection(*server.server_address, timeout=2)
+    try:
+        connection.request("GET", path)
         response = connection.getresponse()
         return response.status, json.loads(response.read())
     finally:
@@ -100,6 +114,39 @@ def test_authenticated_control_endpoints_are_bounded_to_cancel_and_complete_reor
         assert status == 200
         assert stopped["ok"] is True
         assert scheduler.stopped_external == ["portal-ollama"]
+
+        assert post(server, "/api/gpu/rearm", {}, None)[0] == 401
+        rearm_status, rearm = post(
+            server, "/api/gpu/rearm", {}, "test-token"
+        )
+        assert rearm_status == 409
+        assert rearm["reason"] == "windows-reboot-required"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_liveness_and_admission_readiness_are_distinct():
+    scheduler = FakeScheduler()
+    scheduler.ready = False
+    server = ApiServer(
+        ("127.0.0.1", 0),
+        Handler,
+        config=SimpleNamespace(api_token="test-token"),
+        database=FakeDatabase(),
+        scheduler=scheduler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert get(server, "/livez") == (200, {"ok": True})
+        ready_status, ready = get(server, "/readyz")
+        assert ready_status == 503
+        assert ready["ok"] is False
+        health_status, health = get(server, "/api/health")
+        assert health_status == 503
+        assert health["ok"] is False
     finally:
         server.shutdown()
         thread.join(timeout=2)

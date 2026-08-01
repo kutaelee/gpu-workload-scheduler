@@ -1,7 +1,9 @@
 from io import BytesIO
+import json
+import time
 from types import SimpleNamespace
 
-from gpuq.gpu import GpuProcess, GpuTelemetry
+from gpuq.gpu import GpuProcess, GpuTelemetry, GpuTelemetryError
 from gpuq.scheduler import RunningProcess, Scheduler
 
 
@@ -32,21 +34,32 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
     scheduler.last_error = None
     scheduler.admission_not_before_monotonic = 0.0
     scheduler.high_load_transition_gate = None
+    scheduler.transition_state_path = None
+    scheduler.boot_epoch = 123456
+    scheduler.no_touch_until_monotonic = 0.0
+    scheduler.next_gpu_probe_monotonic = 0.0
     scheduler.baseline_used_mb = 1000
     scheduler.gpu_healthy = True
+    scheduler.gpu_fault_status = "healthy"
+    scheduler.gpu_health_consecutive_failures = 0
+    scheduler.gpu_health_recovery_successes = 0
+    scheduler.gpu_health_last_failure_at = None
+    scheduler.gpu_health_last_recovered_at = None
     scheduler.gpu_processes = []
     scheduler.process_scan_error = None
     scheduler.gpu_process_scan_generation = 0
     scheduler.config = SimpleNamespace(
+        gpu_telemetry_enabled=True,
         cancel_grace_seconds=30.0,
         terminate_grace_seconds=10.0,
         post_job_cooldown_seconds=2.0,
-        post_high_load_cooldown_seconds=180.0,
+        post_job_no_touch_seconds=15.0,
+        post_high_load_no_touch_seconds=20.0,
+        post_high_load_probe_interval_seconds=5.0,
         post_high_load_stable_samples=3,
         post_high_load_process_stable_scans=2,
         post_high_load_vram_tolerance_mb=4096,
         post_high_load_max_idle_utilization_percent=5,
-        high_load_min_runtime_seconds=1800.0,
         high_load_min_peak_used_mb=24576,
         gpu_health_recovery_samples=3,
         gpu_telemetry_log_interval_seconds=10.0,
@@ -129,7 +142,8 @@ def test_terminal_failure_runs_cleanup_once_and_pauses_admission(monkeypatch):
     assert transitioned is True
     assert record.cleanup_attempted is True
     assert calls[0][1]["status"] == "failed"
-    assert scheduler.admission_not_before_monotonic == 102.0
+    assert scheduler.admission_not_before_monotonic == 115.0
+    assert scheduler.high_load_transition_gate is not None
 
 
 def test_terminal_process_is_reaped_without_gpu_telemetry(monkeypatch):
@@ -156,7 +170,7 @@ def test_terminal_process_is_reaped_without_gpu_telemetry(monkeypatch):
     assert scheduler.running == {}
 
 
-def test_long_job_arms_stateful_high_load_transition_gate(monkeypatch):
+def test_runtime_alone_does_not_trigger_high_capacity_transition(monkeypatch):
     scheduler, clock = make_scheduler(monkeypatch)
     process = FakeProcess(exit_code=0)
     record = make_record(process)
@@ -173,7 +187,7 @@ def test_long_job_arms_stateful_high_load_transition_gate(monkeypatch):
 
     scheduler._reap_and_cancel(GpuTelemetry("GPU", 32000, 1000, 31000, 0))
 
-    assert scheduler.admission_not_before_monotonic == 280.0
+    assert scheduler.admission_not_before_monotonic == 115.0
     assert scheduler.high_load_transition_gate is not None
     assert scheduler.high_load_transition_gate.job_ids == ("job-long",)
 
@@ -189,7 +203,7 @@ def test_high_load_gate_requires_post_cooldown_telemetry_and_process_stability(
     assert scheduler._evaluate_high_load_transition_gate(telemetry) is False
     assert scheduler.high_load_transition_gate.reason == "minimum-cooldown"
 
-    clock.value = 281.0
+    clock.value = 121.0
     scheduler.gpu_processes = [GpuProcess(42, "comfyui.exe", 1000)]
     scheduler.gpu_process_scan_generation = 1
     assert scheduler._evaluate_high_load_transition_gate(telemetry) is False
@@ -205,10 +219,120 @@ def test_high_load_gate_resets_when_vram_is_not_idle(monkeypatch):
     scheduler, clock = make_scheduler(monkeypatch)
     record = make_record(FakeProcess(exit_code=0))
     scheduler._arm_high_load_transition_gate("job-long", record)
-    clock.value = 281.0
+    clock.value = 121.0
     scheduler.gpu_process_scan_generation = 1
 
     busy = GpuTelemetry("GPU", 32000, 6000, 26000, 2)
     assert scheduler._evaluate_high_load_transition_gate(busy) is False
     assert scheduler.high_load_transition_gate.stable_samples == 0
     assert scheduler.high_load_transition_gate.reason.startswith("vram-not-idle")
+
+
+def test_fatal_gpu_loss_is_persistently_latched(monkeypatch, tmp_path):
+    scheduler, _clock = make_scheduler(monkeypatch)
+    scheduler.fault_state_path = tmp_path / "gpu-fault-state.json"
+    scheduler.boot_epoch = 123456
+    scheduler.provenance = {"git_commit": "test"}
+    scheduler.persisted_fault = None
+    scheduler.transient_failure_backoff_index = 0
+    scheduler._last_gpu_health_log_signature = None
+    scheduler.config.log_root = tmp_path
+
+    scheduler._record_gpu_failure(
+        GpuTelemetryError("GPU is lost; reboot required", returncode=6, fatal=True)
+    )
+
+    state = json.loads(scheduler.fault_state_path.read_text(encoding="utf-8"))
+    assert scheduler.gpu_fault_status == "reboot_required"
+    assert scheduler.gpu_healthy is False
+    assert state["status"] == "reboot_required"
+    assert state["windows_boot_epoch"] == 123456
+    assert scheduler.next_gpu_probe_monotonic == float("inf")
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: (_ for _ in ()).throw(AssertionError("must not probe same boot")),
+    )
+    assert scheduler.rearm_gpu() == {
+        "rearmed": False,
+        "reason": "windows-reboot-required",
+    }
+
+
+def test_no_touch_window_blocks_gpu_probe(monkeypatch):
+    scheduler, clock = make_scheduler(monkeypatch)
+    scheduler.no_touch_until_monotonic = clock.value + 15.0
+
+    reason = scheduler._gpu_probe_block_reason(clock.value)
+
+    assert reason == "post-high-load-no-touch:15.0s"
+
+
+def test_same_boot_fatal_latch_prevents_startup_gpu_probe(monkeypatch, tmp_path):
+    runtime = tmp_path / ".runtime"
+    runtime.mkdir()
+    fault = runtime / "gpu-fault-state.json"
+    fault.write_text(
+        json.dumps(
+            {
+                "status": "reboot_required",
+                "windows_boot_epoch": 123456,
+                "reason": "GPU is lost",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = runtime / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    config = SimpleNamespace(
+        config_path=config_path,
+        gpu_telemetry_enabled=True,
+    )
+    monkeypatch.setattr("gpuq.scheduler.REPO_ROOT", tmp_path)
+    monkeypatch.setattr("gpuq.scheduler.windows_boot_epoch", lambda: 123456)
+    monkeypatch.setattr("gpuq.scheduler.runtime_provenance", lambda *_args: {})
+    monkeypatch.setattr(
+        "gpuq.scheduler.read_gpu",
+        lambda: (_ for _ in ()).throw(AssertionError("must not probe GPU")),
+    )
+    scheduler = Scheduler(config, SimpleNamespace())
+    started = []
+    scheduler.thread = SimpleNamespace(start=lambda: started.append(True))
+
+    scheduler.start()
+
+    assert started == [True]
+    assert scheduler.gpu_fault_status == "reboot_required"
+    assert scheduler.gpu_healthy is False
+
+
+def test_same_boot_no_touch_transition_survives_daemon_restart(
+    monkeypatch, tmp_path
+):
+    runtime = tmp_path / ".runtime"
+    runtime.mkdir()
+    (runtime / "gpu-transition-state.json").write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "windows_boot_epoch": 123456,
+                "job_ids": ["job-prior"],
+                "no_touch_until_unix": time.time() + 15.0,
+                "baseline_used_mb": 2048,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = runtime / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("gpuq.scheduler.REPO_ROOT", tmp_path)
+    monkeypatch.setattr("gpuq.scheduler.windows_boot_epoch", lambda: 123456)
+    monkeypatch.setattr("gpuq.scheduler.runtime_provenance", lambda *_args: {})
+
+    scheduler = Scheduler(
+        SimpleNamespace(config_path=config_path), SimpleNamespace()
+    )
+
+    assert scheduler.high_load_transition_gate is not None
+    assert scheduler.high_load_transition_gate.job_ids == ("job-prior",)
+    assert scheduler.high_load_transition_gate.baseline_used_mb == 2048
+    assert scheduler.no_touch_until_monotonic > time.monotonic()

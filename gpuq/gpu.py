@@ -7,9 +7,31 @@ from dataclasses import asdict, dataclass
 class GpuTelemetryError(RuntimeError):
     """Bounded, secret-free NVIDIA telemetry failure details."""
 
-    def __init__(self, message: str, *, returncode: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        returncode: int | None = None,
+        fatal: bool = False,
+    ):
         super().__init__(message[:1000])
         self.returncode = returncode
+        self.fatal = fatal
+
+
+def is_fatal_gpu_error(exc: Exception) -> bool:
+    if isinstance(exc, GpuTelemetryError) and exc.fatal:
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "gpu is lost",
+            "reboot required",
+            "p2preq",
+            "pcie reorder",
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -61,9 +83,15 @@ def read_gpu() -> GpuTelemetry:
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "no diagnostic output").strip()
+        normalized = detail.lower()
+        fatal = result.returncode == 6 or any(
+            marker in normalized
+            for marker in ("gpu is lost", "reboot required")
+        )
         raise GpuTelemetryError(
             f"nvidia-smi telemetry failed with exit code {result.returncode}: {detail}",
             returncode=result.returncode,
+            fatal=fatal,
         )
     lines = result.stdout.strip().splitlines()
     if not lines:
@@ -135,12 +163,24 @@ def read_gpu_processes() -> list[GpuProcess]:
             "--query-compute-apps=pid,process_name,used_gpu_memory",
             "--format=csv,noheader,nounits",
         ],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         timeout=10,
         creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
     )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "no diagnostic output").strip()
+        normalized = detail.lower()
+        fatal = result.returncode == 6 or any(
+            marker in normalized
+            for marker in ("gpu is lost", "reboot required")
+        )
+        raise GpuTelemetryError(
+            f"nvidia-smi process census failed with exit code {result.returncode}: {detail}",
+            returncode=result.returncode,
+            fatal=fatal,
+        )
     processes: list[GpuProcess] = []
     for line in result.stdout.splitlines()[:128]:
         parts = [part.strip() for part in line.split(",", 2)]

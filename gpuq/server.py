@@ -34,8 +34,15 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/":
             return self._serve_file(REPO_ROOT / "static" / "index.html", "text/html; charset=utf-8")
-        if path == "/api/health":
-            return self._json({"ok": True, "scheduler": self.server.scheduler.snapshot()})
+        if path == "/livez":
+            return self._json({"ok": True})
+        if path in {"/readyz", "/api/health"}:
+            snapshot = self.server.scheduler.snapshot()
+            ready = bool(snapshot.get("admission_ready"))
+            return self._json(
+                {"ok": ready, "scheduler": snapshot},
+                200 if ready else 503,
+            )
         if path == "/api/status":
             jobs = self.server.database.list_jobs()
             scores = self.server.scheduler.scores_for(jobs["queued"])
@@ -81,6 +88,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "managed-jobs-running"}, 409)
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return self._json({"ok": True})
+        if path == "/api/gpu/rearm":
+            result = self.server.scheduler.rearm_gpu()
+            return self._json(result, 200 if result.get("rearmed") else 409)
         if path.startswith("/api/jobs/") and path.endswith("/cancel"):
             job_id = path.removeprefix("/api/jobs/").removesuffix("/cancel").rstrip("/")
             changed = self.server.database.request_cancel(job_id)

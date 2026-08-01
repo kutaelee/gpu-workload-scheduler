@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import Config
+from .config import REPO_ROOT, Config
 from .db import Database
 from .external import (
     inspect_ollama_container,
@@ -18,8 +18,21 @@ from .external import (
     stop_ollama_container,
     stop_ollama_host,
 )
-from .gpu import GpuProcess, GpuTelemetry, read_gpu, read_gpu_processes
+from .gpu import (
+    GpuProcess,
+    GpuTelemetry,
+    is_fatal_gpu_error,
+    read_gpu,
+    read_gpu_processes,
+)
 from .policy import ActiveReservation, Candidate, choose_candidate, effective_score
+from .safety import (
+    fatal_gpu_events_since_boot,
+    read_fault_state,
+    runtime_provenance,
+    windows_boot_epoch,
+    write_fault_state,
+)
 
 
 @dataclass
@@ -70,6 +83,45 @@ class Scheduler:
         self.external_workloads: list[dict] = []
         self.admission_not_before_monotonic = 0.0
         self.high_load_transition_gate: HighLoadTransitionGate | None = None
+        self.no_touch_until_monotonic = 0.0
+        self.next_gpu_probe_monotonic = 0.0
+        self.transient_failure_backoff_index = 0
+        self.boot_epoch = windows_boot_epoch()
+        self.fault_state_path = REPO_ROOT / ".runtime" / "gpu-fault-state.json"
+        self.transition_state_path = (
+            REPO_ROOT / ".runtime" / "gpu-transition-state.json"
+        )
+        self.persisted_fault = read_fault_state(self.fault_state_path)
+        self.gpu_fault_status = "starting"
+        if self.persisted_fault and self.persisted_fault.get("status") == "reboot_required":
+            self.gpu_fault_status = (
+                "reboot_required"
+                if self.persisted_fault.get("windows_boot_epoch") == self.boot_epoch
+                else "rearm_required"
+            )
+        self.provenance = runtime_provenance(REPO_ROOT, config.config_path)
+        persisted_transition = read_fault_state(self.transition_state_path)
+        if (
+            persisted_transition
+            and persisted_transition.get("status") == "active"
+            and persisted_transition.get("windows_boot_epoch") == self.boot_epoch
+        ):
+            remaining = max(
+                0.0,
+                float(persisted_transition.get("no_touch_until_unix", 0.0))
+                - time.time(),
+            )
+            not_before = time.monotonic() + remaining
+            self.high_load_transition_gate = HighLoadTransitionGate(
+                job_ids=tuple(persisted_transition.get("job_ids") or ()),
+                not_before_monotonic=not_before,
+                baseline_used_mb=max(
+                    0, int(persisted_transition.get("baseline_used_mb") or 0)
+                ),
+            )
+            self.no_touch_until_monotonic = not_before
+            self.next_gpu_probe_monotonic = not_before
+            self.admission_not_before_monotonic = not_before
         self.gpu_healthy = False
         self.gpu_health_consecutive_failures = 0
         self.gpu_health_recovery_successes = 0
@@ -79,6 +131,15 @@ class Scheduler:
         self._last_gpu_telemetry_log_monotonic = 0.0
 
     def start(self) -> None:
+        if not self.config.gpu_telemetry_enabled:
+            self.gpu_fault_status = "telemetry_disabled"
+            self.last_decision = "telemetry-disabled"
+            self.thread.start()
+            return
+        if self.gpu_fault_status in {"reboot_required", "rearm_required"}:
+            self.last_decision = f"gpu-{self.gpu_fault_status}"
+            self.thread.start()
+            return
         try:
             telemetry = read_gpu()
         except Exception as exc:
@@ -87,6 +148,7 @@ class Scheduler:
             self.telemetry = telemetry
             self.baseline_used_mb = telemetry.used_mb
             self.gpu_healthy = True
+            self.gpu_fault_status = "healthy"
             self._refresh_gpu_processes(force=True)
             self._refresh_external_workloads(force=True)
         self.thread.start()
@@ -110,12 +172,17 @@ class Scheduler:
                 "last_known_gpu": last_known_telemetry,
                 "gpu_health": {
                     "status": (
-                        "healthy"
-                        if self.gpu_healthy
+                        self.gpu_fault_status
+                        if self.gpu_fault_status
+                        in {"reboot_required", "rearm_required", "telemetry_disabled"}
                         else (
-                            "recovering"
-                            if self.gpu_health_recovery_successes
-                            else "blocked"
+                            "healthy"
+                            if self.gpu_healthy
+                            else (
+                                "recovering"
+                                if self.gpu_health_recovery_successes
+                                else "blocked"
+                            )
                         )
                     ),
                     "consecutive_failures": self.gpu_health_consecutive_failures,
@@ -123,7 +190,13 @@ class Scheduler:
                     "recovery_samples_required": self.config.gpu_health_recovery_samples,
                     "last_failure_at": self.gpu_health_last_failure_at,
                     "last_recovered_at": self.gpu_health_last_recovered_at,
+                    "fault_latched": self.gpu_fault_status
+                    in {"reboot_required", "rearm_required"},
+                    "manual_rearm_required": self.gpu_fault_status
+                    in {"reboot_required", "rearm_required"},
                 },
+                "admission_ready": self.admission_ready(),
+                "runtime_provenance": dict(self.provenance),
                 "baseline_used_mb": self.baseline_used_mb,
                 "safety_vram_mb": self.config.safety_vram_mb,
                 "fairness_window_minutes": self.config.fairness_window_minutes,
@@ -138,8 +211,21 @@ class Scheduler:
                 "post_job_cooldown_remaining_seconds": max(
                     0.0, self.admission_not_before_monotonic - time.monotonic()
                 ),
-                "high_load_transition_gate": self._transition_gate_snapshot(),
+                "transition_gate": self._transition_gate_snapshot(),
+                "no_touch_remaining_seconds": max(
+                    0.0, self.no_touch_until_monotonic - time.monotonic()
+                ),
             }
+
+    def admission_ready(self) -> bool:
+        return bool(
+            self.config.gpu_telemetry_enabled
+            and self.gpu_healthy
+            and self.gpu_fault_status == "healthy"
+            and self.high_load_transition_gate is None
+            and time.monotonic() >= self.admission_not_before_monotonic
+            and time.monotonic() >= self.no_touch_until_monotonic
+        )
 
     def scores_for(self, queued: list[dict]) -> dict[str, float]:
         if not queued:
@@ -186,13 +272,25 @@ class Scheduler:
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
+            now_monotonic = time.monotonic()
+            probe_block_reason = self._gpu_probe_block_reason(now_monotonic)
+
+            if probe_block_reason is not None:
+                try:
+                    self._reap_and_cancel(None)
+                    with self.lock:
+                        self.last_decision = probe_block_reason
+                    self.database.set_state("runtime", self.snapshot())
+                except Exception as exc:
+                    with self.lock:
+                        self.last_error = f"{type(exc).__name__}: {exc}"[:1000]
+                self.stop_event.wait(self.config.poll_seconds)
+                continue
+
             try:
                 telemetry = read_gpu()
             except Exception as exc:
                 self._record_gpu_failure(exc)
-                # A lost GPU must block admission, but process lifecycle still
-                # needs to advance so exited/canceled jobs do not remain stuck
-                # as running merely because telemetry is unavailable.
                 self._reap_and_cancel(None)
                 try:
                     self.database.set_state("runtime", self.snapshot())
@@ -208,16 +306,27 @@ class Scheduler:
             try:
                 recovered = self._record_gpu_success(telemetry)
                 self._log_gpu_telemetry(telemetry)
-                self._refresh_gpu_processes()
-                self._refresh_external_workloads()
                 terminal_transition = self._reap_and_cancel(telemetry)
+                if self.gpu_healthy and not terminal_transition:
+                    gate = self.high_load_transition_gate
+                    self._refresh_gpu_processes(
+                        force=bool(
+                            gate is not None
+                            and time.monotonic() >= gate.not_before_monotonic
+                        )
+                    )
+                    self._refresh_external_workloads()
                 active_rows = self.database.active_jobs()
                 if not active_rows and self.high_load_transition_gate is None:
                     self.baseline_used_mb = telemetry.used_mb
                 if terminal_transition:
                     with self.lock:
-                        self.last_decision = "post-job-cooldown"
+                        self.last_decision = "post-job-no-touch"
                 elif not self.gpu_healthy:
+                    if self.gpu_fault_status == "transient_failure":
+                        self.next_gpu_probe_monotonic = (
+                            time.monotonic() + 5.0
+                        )
                     with self.lock:
                         self.last_decision = (
                             "gpu-health-recovering:"
@@ -225,14 +334,19 @@ class Scheduler:
                             f"{self.config.gpu_health_recovery_samples}"
                         )
                 elif not self._evaluate_high_load_transition_gate(telemetry):
+                    self.next_gpu_probe_monotonic = (
+                        time.monotonic()
+                        + self.config.post_high_load_probe_interval_seconds
+                    )
                     with self.lock:
                         gate = self.high_load_transition_gate
                         self.last_decision = (
-                            f"post-high-load-transition:{gate.reason}"
+                            f"post-transition:{gate.reason}"
                             if gate is not None
-                            else "post-high-load-transition"
+                            else "post-transition"
                         )
                 else:
+                    self.next_gpu_probe_monotonic = 0.0
                     if recovered:
                         self._pause_admission()
                     self._schedule_once(telemetry, active_rows)
@@ -242,21 +356,63 @@ class Scheduler:
                     self.last_error = f"{type(exc).__name__}: {exc}"[:1000]
             self.stop_event.wait(self.config.poll_seconds)
 
+    def _gpu_probe_block_reason(self, now_monotonic: float) -> str | None:
+        if not self.config.gpu_telemetry_enabled:
+            return "telemetry-disabled"
+        if self.gpu_fault_status in {"reboot_required", "rearm_required"}:
+            return f"gpu-{self.gpu_fault_status}"
+        if now_monotonic < self.no_touch_until_monotonic:
+            return (
+                "post-high-load-no-touch:"
+                f"{self.no_touch_until_monotonic - now_monotonic:.1f}s"
+            )
+        if now_monotonic < self.next_gpu_probe_monotonic:
+            return (
+                "gpu-probe-backoff:"
+                f"{self.next_gpu_probe_monotonic - now_monotonic:.1f}s"
+            )
+        return None
+
     def _record_gpu_failure(self, exc: Exception) -> None:
         now = datetime.now(timezone.utc).isoformat()
         error = f"{type(exc).__name__}: {exc}"[:1000]
+        fatal = is_fatal_gpu_error(exc)
         with self.lock:
             self.gpu_healthy = False
             self.gpu_health_consecutive_failures += 1
             self.gpu_health_recovery_successes = 0
             self.gpu_health_last_failure_at = now
-            self.last_decision = "gpu-health-blocked"
+            self.gpu_fault_status = (
+                "reboot_required" if fatal else "transient_failure"
+            )
+            self.last_decision = (
+                "gpu-reboot-required" if fatal else "gpu-health-blocked"
+            )
             self.last_error = error
             if self.high_load_transition_gate is not None:
                 self.high_load_transition_gate.stable_samples = 0
                 self.high_load_transition_gate.process_stable_scans = 0
                 self.high_load_transition_gate.reason = "gpu-health-blocked"
-        self._log_gpu_health_event("blocked", error)
+        if fatal:
+            fault = {
+                "schema_version": 1,
+                "status": "reboot_required",
+                "latched_at": now,
+                "windows_boot_epoch": self.boot_epoch,
+                "reason": error,
+                "runtime_provenance": self.provenance,
+            }
+            write_fault_state(self.fault_state_path, fault)
+            self.persisted_fault = fault
+            self.next_gpu_probe_monotonic = float("inf")
+        else:
+            delays = (5.0, 15.0, 60.0)
+            delay = delays[min(self.transient_failure_backoff_index, 2)]
+            self.transient_failure_backoff_index = min(
+                self.transient_failure_backoff_index + 1, 2
+            )
+            self.next_gpu_probe_monotonic = time.monotonic() + delay
+        self._log_gpu_health_event(self.gpu_fault_status, error)
 
     def _record_gpu_success(self, telemetry: GpuTelemetry) -> bool:
         recovered = False
@@ -271,6 +427,8 @@ class Scheduler:
                 >= self.config.gpu_health_recovery_samples
             ):
                 self.gpu_healthy = True
+                self.gpu_fault_status = "healthy"
+                self.transient_failure_backoff_index = 0
                 self.gpu_health_consecutive_failures = 0
                 self.gpu_health_recovery_successes = 0
                 self.gpu_health_last_recovered_at = datetime.now(
@@ -292,6 +450,7 @@ class Scheduler:
             "status": status,
             "error": error,
             "consecutive_failures": self.gpu_health_consecutive_failures,
+            "runtime_provenance": self.provenance,
         }
         try:
             self.config.log_root.mkdir(parents=True, exist_ok=True)
@@ -312,7 +471,16 @@ class Scheduler:
             return
         self._last_gpu_telemetry_log_monotonic = now_monotonic
         now = datetime.now(timezone.utc)
-        event = {"timestamp": now.isoformat(), **telemetry.to_dict()}
+        event = {
+            "timestamp": now.isoformat(),
+            "git_commit": self.provenance.get("git_commit"),
+            "git_branch": self.provenance.get("git_branch"),
+            "dirty_worktree": self.provenance.get("dirty_worktree"),
+            "config_sha256": self.provenance.get("config_sha256"),
+            "service_started_at": self.provenance.get("service_started_at"),
+            "windows_boot_epoch": self.provenance.get("windows_boot_epoch"),
+            **telemetry.to_dict(),
+        }
         try:
             self.config.log_root.mkdir(parents=True, exist_ok=True)
             path = self.config.log_root / f"gpu-telemetry-{now:%Y%m%d}.jsonl"
@@ -336,6 +504,8 @@ class Scheduler:
         try:
             processes = read_gpu_processes()
         except Exception as exc:
+            if is_fatal_gpu_error(exc):
+                self._record_gpu_failure(exc)
             with self.lock:
                 self.process_scan_error = f"{type(exc).__name__}: {exc}"
                 self.last_process_scan_monotonic = now
@@ -425,6 +595,57 @@ class Scheduler:
         self._refresh_external_workloads(force=True)
         return result
 
+    def rearm_gpu(self) -> dict:
+        if self.gpu_fault_status not in {"reboot_required", "rearm_required"}:
+            return {"rearmed": False, "reason": "no-fatal-latch"}
+        latched_boot = (self.persisted_fault or {}).get("windows_boot_epoch")
+        if latched_boot == self.boot_epoch:
+            return {"rearmed": False, "reason": "windows-reboot-required"}
+        try:
+            event_count = fatal_gpu_events_since_boot()
+        except Exception as exc:
+            return {
+                "rearmed": False,
+                "reason": "windows-event-check-failed",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
+        if event_count:
+            return {
+                "rearmed": False,
+                "reason": "current-boot-nvlddmkm-errors",
+                "event_count": event_count,
+            }
+        try:
+            telemetry = read_gpu()
+        except Exception as exc:
+            if is_fatal_gpu_error(exc):
+                self._record_gpu_failure(exc)
+            return {
+                "rearmed": False,
+                "reason": "gpu-health-check-failed",
+                "error": f"{type(exc).__name__}: {exc}"[:500],
+            }
+        cleared = {
+            "schema_version": 1,
+            "status": "cleared",
+            "rearmed_at": datetime.now(timezone.utc).isoformat(),
+            "windows_boot_epoch": self.boot_epoch,
+            "prior_fault": self.persisted_fault,
+        }
+        write_fault_state(self.fault_state_path, cleared)
+        with self.lock:
+            self.persisted_fault = cleared
+            self.telemetry = telemetry
+            self.baseline_used_mb = telemetry.used_mb
+            self.gpu_healthy = True
+            self.gpu_fault_status = "healthy"
+            self.gpu_health_consecutive_failures = 0
+            self.gpu_health_recovery_successes = 0
+            self.last_error = None
+            self.last_decision = "gpu-manually-rearmed"
+            self.next_gpu_probe_monotonic = 0.0
+        return {"rearmed": True, "gpu": telemetry.to_dict()}
+
     def _reap_and_cancel(self, telemetry: GpuTelemetry | None) -> bool:
         terminal_transition = False
         with self.lock:
@@ -457,10 +678,18 @@ class Scheduler:
                     error=error,
                 )
                 self._close_record(job_id)
-                if self._is_high_load_terminal_job(job, record, telemetry):
-                    self._arm_high_load_transition_gate(job_id, record)
-                else:
-                    self._pause_admission(self.config.post_job_cooldown_seconds)
+                high_capacity = self._is_high_load_terminal_job(
+                    job, record, telemetry
+                )
+                self._arm_high_load_transition_gate(
+                    job_id,
+                    record,
+                    no_touch_seconds=(
+                        self.config.post_high_load_no_touch_seconds
+                        if high_capacity
+                        else self.config.post_job_no_touch_seconds
+                    ),
+                )
                 terminal_transition = True
                 continue
             if job and job.get("cancel_requested"):
@@ -574,20 +803,22 @@ class Scheduler:
         record: RunningProcess,
         telemetry: GpuTelemetry | None,
     ) -> bool:
-        runtime_seconds = max(0.0, time.monotonic() - record.started_monotonic)
         peak_used_mb = int((job or {}).get("peak_total_gpu_used_mb") or 0)
         if telemetry is not None:
             peak_used_mb = max(peak_used_mb, telemetry.used_mb)
-        return (
-            runtime_seconds >= self.config.high_load_min_runtime_seconds
-            or peak_used_mb >= self.config.high_load_min_peak_used_mb
-        )
+        return peak_used_mb >= self.config.high_load_min_peak_used_mb
 
     def _arm_high_load_transition_gate(
-        self, job_id: str, record: RunningProcess
+        self,
+        job_id: str,
+        record: RunningProcess,
+        *,
+        no_touch_seconds: float | None = None,
     ) -> None:
+        if no_touch_seconds is None:
+            no_touch_seconds = self.config.post_high_load_no_touch_seconds
         not_before = (
-            time.monotonic() + self.config.post_high_load_cooldown_seconds
+            time.monotonic() + no_touch_seconds
         )
         baseline_used_mb = max(0, record.baseline_used_mb)
         with self.lock:
@@ -608,6 +839,23 @@ class Scheduler:
             )
             self.admission_not_before_monotonic = max(
                 self.admission_not_before_monotonic, not_before
+            )
+            self.no_touch_until_monotonic = max(
+                self.no_touch_until_monotonic, not_before
+            )
+            self.next_gpu_probe_monotonic = max(
+                self.next_gpu_probe_monotonic, not_before
+            )
+            self._write_transition_state(
+                {
+                    "schema_version": 1,
+                    "status": "active",
+                    "job_ids": list(job_ids),
+                    "windows_boot_epoch": self.boot_epoch,
+                    "no_touch_until_unix": time.time()
+                    + max(0.0, not_before - time.monotonic()),
+                    "baseline_used_mb": baseline_used_mb,
+                }
             )
 
     def _evaluate_high_load_transition_gate(
@@ -693,8 +941,22 @@ class Scheduler:
 
         self.high_load_transition_gate = None
         self.admission_not_before_monotonic = 0.0
+        self.no_touch_until_monotonic = 0.0
         self.baseline_used_mb = telemetry.used_mb
+        self._write_transition_state(
+            {
+                "schema_version": 1,
+                "status": "cleared",
+                "cleared_at": datetime.now(timezone.utc).isoformat(),
+                "windows_boot_epoch": self.boot_epoch,
+            }
+        )
         return True
+
+    def _write_transition_state(self, value: dict) -> None:
+        path = getattr(self, "transition_state_path", None)
+        if path is not None:
+            write_fault_state(path, value)
 
     def _pause_admission(self, seconds: float | None = None) -> None:
         if seconds is None:
@@ -711,12 +973,12 @@ class Scheduler:
             return
         if self.high_load_transition_gate is not None:
             with self.lock:
-                self.last_decision = "post-high-load-transition"
+                self.last_decision = "post-transition"
             return
         cooldown_remaining = self.admission_not_before_monotonic - time.monotonic()
         if cooldown_remaining > 0:
             with self.lock:
-                self.last_decision = f"post-job-cooldown:{cooldown_remaining:.1f}s"
+                self.last_decision = f"gpu-recovery-pause:{cooldown_remaining:.1f}s"
             return
         queued_rows = self.database.queue_candidates(self.config.fairness_window_minutes)
         queued = [_candidate(row) for row in queued_rows]
@@ -743,6 +1005,21 @@ class Scheduler:
         if candidate is None:
             return
         row = next(item for item in queued_rows if item["id"] == candidate.id)
+        argv = row["argv"]
+        if isinstance(argv, str):
+            argv = json.loads(argv)
+        is_wsl = bool(argv) and Path(argv[0]).name.lower() in {"wsl", "wsl.exe"}
+        if is_wsl:
+            conflicts = [
+                process
+                for process in self.gpu_processes
+                if "comfyui" in process.process_name.lower()
+                or process.process_name.lower().endswith("python.exe")
+            ]
+            if conflicts:
+                with self.lock:
+                    self.last_decision = "wsl-blocked-by-windows-cuda-context"
+                return
         self._launch(row, reason)
 
     def _launch(self, job: dict, reason: str) -> None:
