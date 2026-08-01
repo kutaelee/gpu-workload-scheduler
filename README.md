@@ -3,8 +3,9 @@
 Single-GPU reservation queue for the RTX 5090 workstation. Agents submit a
 command with required VRAM, expected duration, and priority. The host daemon
 starts only jobs that fit the guarded VRAM budget, ages waiting jobs to prevent
-starvation, penalizes recent per-agent VRAM-seconds, and safely backfills short
-jobs without delaying the highest-ranked blocked job.
+starvation, and penalizes recent per-agent VRAM-seconds. The incident-diagnostic
+default is strict serialization (`max_parallel_jobs=1`); parallel backfill is
+not enabled by the installer.
 
 The Local Knowledge Portal can request a managed job stop and reorder queued
 jobs. A stop is cooperative first (Ctrl+Break). Native jobs then use bounded
@@ -22,12 +23,65 @@ Detached helpers such as Docker-hosted Ollama use the operator-owned
 one exact argv allowlist entry. API clients cannot provide cleanup commands;
 the scheduler runs the configured argv without a shell after cancel or timeout.
 
-After any job reaches a terminal state, admission pauses for a short configurable
-cooldown (2 seconds by default, one telemetry cycle). Failed and canceled jobs
-run their allowlisted cleanup once before the queue admits replacement work.
+After a job reaches a terminal state, the scheduler stops all NVIDIA queries
+for 15 seconds. A measured peak of at least 24 GiB extends only this no-touch
+window to 20 seconds; runtime duration and temperature do not classify a job
+as high load. After the no-touch window, admission requires three idle
+telemetry samples and two unchanged process censuses at five-second intervals.
+Healthy handoff therefore normally completes in about 25-30 seconds instead of
+waiting a fixed 180 seconds. Any failed query, renewed utilization, excess
+resident VRAM, or changed process census resets the evidence. Failed and
+canceled jobs still run their allowlisted cleanup once.
 
-ComfyUI's standard `E:\AI\Apps\ComfyUI\run-comfyui.ps1` starts only the
-lightweight loopback UI server. Its local GPUQ bridge admits each `/prompt` and
+Workloads listed in `reboot_boundary_workloads` use a stricter diagnostic
+boundary. When one reaches any terminal state, GPUQ persists the job and boot
+epoch in `.runtime/gpu-workload-reboot-boundary.json`, stops all further
+NVIDIA queries, and blocks admission for the rest of that Windows boot. The
+latch clears only by observing a later boot; daemon restart cannot bypass it.
+The boundary is first persisted as `armed` immediately before process launch;
+a daemon that restarts while the process is running treats that state as an
+active same-boot boundary. Process exit is checked before every NVIDIA query,
+so the terminal transition starts without one final telemetry touch.
+GPUQ deliberately does not run `wsl --terminate` automatically because a
+shared distro can contain unrelated services. Use this allowlist only while a
+driver/GPU-PV handoff fault is under diagnosis, or for workloads that require
+an explicit reboot boundary by policy.
+
+`reboot_boundary_workload_patterns` provides the same boundary for an explicit
+set of lowercase shell-style workload-key patterns (`*` and `?`). This prevents
+versioned diagnostic jobs from silently escaping the boundary when only their
+run number or subject suffix changes. Patterns apply to the declared GPUQ
+workload key, never to argv or environment data. Keep them narrow; for example,
+`wedding-*klein9b*qfloat8*` covers the currently isolated Klein 9B qfloat8
+training family without blocking unrelated ComfyUI prompts.
+
+GPU telemetry is an admission circuit breaker. Transient query failures back
+off 5, 15, then 60 seconds while process lifecycle reaping continues without
+touching NVIDIA. Exit code 6, `GPU is lost`, or `reboot required` is different:
+it atomically latches `reboot_required` in `.runtime/gpu-fault-state.json` and
+the current boot performs no further `nvidia-smi` calls, even after daemon
+restart. A later boot remains `rearm_required` until an authenticated manual
+rearm confirms a changed boot epoch, no current-boot nvlddmkm 14/153 events,
+and one successful GPU query. State changes are appended without commands or
+environment data to `E:\Data\GpuScheduler\Logs\gpu-health.jsonl`.
+An NVIDIA query timeout while a configured reboot-boundary workload is still
+running is also fatal: GPUQ does not perform a second query in that boot.
+
+`GET /livez` reports only API-process liveness. `GET /readyz` and the legacy
+`GET /api/health` report admission readiness and return HTTP 503 while the GPU
+is blocked, in no-touch transition, or awaiting manual rearm. Runtime status
+also records the Git commit/branch, dirty-worktree flag, config SHA-256, service
+start time, and Windows boot epoch.
+
+For post-incident analysis, a 10-second rolling sample of temperature, power
+draw/limit, graphics and memory clocks, PCIe generation/width, VRAM,
+utilization, and driver version is appended to daily
+`gpu-telemetry-YYYYMMDD.jsonl` files in the same log directory. These records
+contain no process command lines or environment values.
+
+ComfyUI's standard `E:\AI\Apps\ComfyUI\run-comfyui.ps1` first requires GPUQ
+admission readiness and refuses startup while another managed job is active.
+Its local GPUQ bridge admits each `/prompt` and
 `/api/prompt` request as an individual `comfyui-prompt` queue job. The retired
 `run-comfyui-gpuq.ps1` server-wide reservation must not be restored: it hides
 individual prompts and lets an idle UI block unrelated GPU work.
@@ -136,8 +190,9 @@ The dashboard is read-only. Mutation APIs require the token from
 ```
 
 Integration verification should submit two bounded test jobs with known VRAM
-and duration, observe serialized or safe-backfilled execution, then inspect the
-exit codes and per-job logs.
+and duration, observe serialized execution, then inspect the exit codes and
+per-job logs. An active transition gate is persisted, so restarting the daemon
+cannot bypass either the no-touch deadline or the required health samples.
 
 ## Backup and restore
 

@@ -12,6 +12,7 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / ".runtime" / "config.json"
 
 @dataclass(frozen=True)
 class Config:
+    config_path: Path
     database_url: str
     api_token: str
     api_host: str
@@ -20,12 +21,25 @@ class Config:
     safety_vram_mb: int
     fairness_window_minutes: int
     max_parallel_jobs: int
+    gpu_telemetry_enabled: bool
     poll_seconds: float
     process_scan_interval_seconds: float
     cancel_grace_seconds: float
     terminate_grace_seconds: float
     post_job_cooldown_seconds: float
+    post_job_no_touch_seconds: float
+    post_high_load_no_touch_seconds: float
+    post_high_load_probe_interval_seconds: float
+    post_high_load_stable_samples: int
+    post_high_load_process_stable_scans: int
+    post_high_load_vram_tolerance_mb: int
+    post_high_load_max_idle_utilization_percent: int
+    high_load_min_peak_used_mb: int
+    gpu_health_recovery_samples: int
+    gpu_telemetry_log_interval_seconds: float
     wsl_force_terminate: bool
+    reboot_boundary_workloads: frozenset[str] = field(default_factory=frozenset)
+    reboot_boundary_workload_patterns: tuple[str, ...] = ()
     cleanup_commands: dict[str, tuple[str, ...]] = field(default_factory=dict)
     external_workloads: dict[str, dict[str, str]] = field(default_factory=dict)
 
@@ -81,7 +95,21 @@ class Config:
                     "executable": str(executable_path),
                     "label": label.strip()[:120],
                 }
+        reboot_boundary_workloads = frozenset(
+            workload
+            for workload in (raw.get("reboot_boundary_workloads") or [])
+            if isinstance(workload, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,119}", workload)
+        )
+        reboot_boundary_workload_patterns = tuple(
+            pattern
+            for pattern in (raw.get("reboot_boundary_workload_patterns") or [])
+            if isinstance(pattern, str)
+            and re.fullmatch(r"[a-z0-9*?._-]{1,120}", pattern)
+            and any(character.isalnum() for character in pattern)
+        )
         return cls(
+            config_path=path,
             database_url=raw["database_url"],
             api_token=raw["api_token"],
             api_host=raw.get("api_host", "127.0.0.1"),
@@ -89,13 +117,55 @@ class Config:
             log_root=Path(raw.get("log_root", r"E:\Data\GpuScheduler\Logs")),
             safety_vram_mb=int(raw.get("safety_vram_mb", 2048)),
             fairness_window_minutes=int(raw.get("fairness_window_minutes", 60)),
-            max_parallel_jobs=int(raw.get("max_parallel_jobs", 2)),
+            max_parallel_jobs=max(1, int(raw.get("max_parallel_jobs", 1))),
+            gpu_telemetry_enabled=bool(raw.get("gpu_telemetry_enabled", True)),
             poll_seconds=float(raw.get("poll_seconds", 2.0)),
-            process_scan_interval_seconds=float(raw.get("process_scan_interval_seconds", 15.0)),
+            process_scan_interval_seconds=max(
+                30.0, float(raw.get("process_scan_interval_seconds", 30.0))
+            ),
             cancel_grace_seconds=float(raw.get("cancel_grace_seconds", 30.0)),
             terminate_grace_seconds=float(raw.get("terminate_grace_seconds", 10.0)),
             post_job_cooldown_seconds=float(raw.get("post_job_cooldown_seconds", 2.0)),
+            post_job_no_touch_seconds=max(
+                15.0, float(raw.get("post_job_no_touch_seconds", 15.0))
+            ),
+            post_high_load_no_touch_seconds=max(
+                20.0, float(raw.get("post_high_load_no_touch_seconds", 20.0))
+            ),
+            post_high_load_probe_interval_seconds=max(
+                5.0,
+                float(raw.get("post_high_load_probe_interval_seconds", 5.0)),
+            ),
+            post_high_load_stable_samples=max(
+                3, int(raw.get("post_high_load_stable_samples", 3))
+            ),
+            post_high_load_process_stable_scans=max(
+                1, int(raw.get("post_high_load_process_stable_scans", 2))
+            ),
+            post_high_load_vram_tolerance_mb=max(
+                0, int(raw.get("post_high_load_vram_tolerance_mb", 4096))
+            ),
+            post_high_load_max_idle_utilization_percent=max(
+                0,
+                min(
+                    100,
+                    int(raw.get("post_high_load_max_idle_utilization_percent", 5)),
+                ),
+            ),
+            high_load_min_peak_used_mb=int(
+                raw.get("high_load_min_peak_used_mb", 24576)
+            ),
+            gpu_health_recovery_samples=max(
+                1, int(raw.get("gpu_health_recovery_samples", 3))
+            ),
+            gpu_telemetry_log_interval_seconds=max(
+                2.0, float(raw.get("gpu_telemetry_log_interval_seconds", 10.0))
+            ),
             wsl_force_terminate=bool(raw.get("wsl_force_terminate", False)),
+            reboot_boundary_workloads=reboot_boundary_workloads,
+            reboot_boundary_workload_patterns=(
+                reboot_boundary_workload_patterns
+            ),
             cleanup_commands=cleanup_commands,
             external_workloads=external_workloads,
         )
