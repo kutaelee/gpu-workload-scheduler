@@ -26,6 +26,10 @@ class Config:
     terminate_grace_seconds: float
     post_job_cooldown_seconds: float
     post_high_load_cooldown_seconds: float
+    post_high_load_stable_samples: int
+    post_high_load_process_stable_scans: int
+    post_high_load_vram_tolerance_mb: int
+    post_high_load_max_idle_utilization_percent: int
     high_load_min_runtime_seconds: float
     high_load_min_peak_used_mb: int
     gpu_health_recovery_samples: int
@@ -102,6 +106,22 @@ class Config:
             post_job_cooldown_seconds=float(raw.get("post_job_cooldown_seconds", 2.0)),
             post_high_load_cooldown_seconds=float(
                 raw.get("post_high_load_cooldown_seconds", 180.0)
+            ),
+            post_high_load_stable_samples=max(
+                1, int(raw.get("post_high_load_stable_samples", 10))
+            ),
+            post_high_load_process_stable_scans=max(
+                1, int(raw.get("post_high_load_process_stable_scans", 2))
+            ),
+            post_high_load_vram_tolerance_mb=max(
+                0, int(raw.get("post_high_load_vram_tolerance_mb", 4096))
+            ),
+            post_high_load_max_idle_utilization_percent=max(
+                0,
+                min(
+                    100,
+                    int(raw.get("post_high_load_max_idle_utilization_percent", 5)),
+                ),
             ),
             high_load_min_runtime_seconds=float(
                 raw.get("high_load_min_runtime_seconds", 1800.0)

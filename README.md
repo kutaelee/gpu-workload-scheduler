@@ -25,9 +25,14 @@ the scheduler runs the configured argv without a shell after cancel or timeout.
 After any job reaches a terminal state, admission pauses for a configurable
 cooldown (2 seconds by default). A job that ran for at least 30 minutes or
 reached at least 24 GiB total GPU usage triggers a 180-second high-load
-cooldown. The longer deadline survives intervening short jobs, preventing a
-fresh model load immediately after sustained or near-capacity GPU work. Failed
-and canceled jobs run their allowlisted cleanup once before the queue admits
+minimum cooldown. That deadline is not sufficient by itself: after it expires,
+the scheduler also requires 10 consecutive idle telemetry samples, VRAM no more
+than 4 GiB above the pre-job baseline, utilization no greater than 5%, and two
+unchanged periodic GPU-process censuses. Any failed health/process query or
+renewed load resets the stability evidence. The longer transition gate survives
+intervening short jobs and blocks scheduling independently, preventing a fresh
+model load immediately after sustained or near-capacity GPU work. Failed and
+canceled jobs run their allowlisted cleanup once before the queue admits
 replacement work.
 
 GPU telemetry is an admission circuit breaker. If `nvidia-smi` fails or returns

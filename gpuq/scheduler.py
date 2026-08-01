@@ -35,6 +35,19 @@ class RunningProcess:
     terminate_sent_at: float | None = None
     cleanup_attempted: bool = False
     cleanup_error: str | None = None
+    baseline_used_mb: int = 0
+
+
+@dataclass
+class HighLoadTransitionGate:
+    job_ids: tuple[str, ...]
+    not_before_monotonic: float
+    baseline_used_mb: int
+    stable_samples: int = 0
+    process_stable_scans: int = 0
+    last_process_generation: int = 0
+    last_process_signature: tuple[tuple[int, str], ...] = ()
+    reason: str = "minimum-cooldown"
 
 
 class Scheduler:
@@ -52,9 +65,11 @@ class Scheduler:
         self.gpu_processes: list[GpuProcess] = []
         self.process_scan_error: str | None = None
         self.last_process_scan_monotonic = 0.0
+        self.gpu_process_scan_generation = 0
         self.last_external_scan_monotonic = 0.0
         self.external_workloads: list[dict] = []
         self.admission_not_before_monotonic = 0.0
+        self.high_load_transition_gate: HighLoadTransitionGate | None = None
         self.gpu_healthy = False
         self.gpu_health_consecutive_failures = 0
         self.gpu_health_recovery_successes = 0
@@ -123,6 +138,7 @@ class Scheduler:
                 "post_job_cooldown_remaining_seconds": max(
                     0.0, self.admission_not_before_monotonic - time.monotonic()
                 ),
+                "high_load_transition_gate": self._transition_gate_snapshot(),
             }
 
     def scores_for(self, queued: list[dict]) -> dict[str, float]:
@@ -143,6 +159,29 @@ class Scheduler:
                 2,
             )
             for row in queued
+        }
+
+    def _transition_gate_snapshot(self) -> dict | None:
+        gate = self.high_load_transition_gate
+        if gate is None:
+            return None
+        return {
+            "job_ids": list(gate.job_ids),
+            "minimum_cooldown_remaining_seconds": max(
+                0.0, gate.not_before_monotonic - time.monotonic()
+            ),
+            "baseline_used_mb": gate.baseline_used_mb,
+            "vram_limit_mb": (
+                gate.baseline_used_mb
+                + self.config.post_high_load_vram_tolerance_mb
+            ),
+            "stable_samples": gate.stable_samples,
+            "stable_samples_required": self.config.post_high_load_stable_samples,
+            "process_stable_scans": gate.process_stable_scans,
+            "process_stable_scans_required": (
+                self.config.post_high_load_process_stable_scans
+            ),
+            "reason": gate.reason,
         }
 
     def _loop(self) -> None:
@@ -173,7 +212,7 @@ class Scheduler:
                 self._refresh_external_workloads()
                 terminal_transition = self._reap_and_cancel(telemetry)
                 active_rows = self.database.active_jobs()
-                if not active_rows:
+                if not active_rows and self.high_load_transition_gate is None:
                     self.baseline_used_mb = telemetry.used_mb
                 if terminal_transition:
                     with self.lock:
@@ -184,6 +223,14 @@ class Scheduler:
                             "gpu-health-recovering:"
                             f"{self.gpu_health_recovery_successes}/"
                             f"{self.config.gpu_health_recovery_samples}"
+                        )
+                elif not self._evaluate_high_load_transition_gate(telemetry):
+                    with self.lock:
+                        gate = self.high_load_transition_gate
+                        self.last_decision = (
+                            f"post-high-load-transition:{gate.reason}"
+                            if gate is not None
+                            else "post-high-load-transition"
                         )
                 else:
                     if recovered:
@@ -205,6 +252,10 @@ class Scheduler:
             self.gpu_health_last_failure_at = now
             self.last_decision = "gpu-health-blocked"
             self.last_error = error
+            if self.high_load_transition_gate is not None:
+                self.high_load_transition_gate.stable_samples = 0
+                self.high_load_transition_gate.process_stable_scans = 0
+                self.high_load_transition_gate.reason = "gpu-health-blocked"
         self._log_gpu_health_event("blocked", error)
 
     def _record_gpu_success(self, telemetry: GpuTelemetry) -> bool:
@@ -293,6 +344,7 @@ class Scheduler:
             self.gpu_processes = processes
             self.process_scan_error = None
             self.last_process_scan_monotonic = now
+            self.gpu_process_scan_generation += 1
 
     def _refresh_external_workloads(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -405,9 +457,10 @@ class Scheduler:
                     error=error,
                 )
                 self._close_record(job_id)
-                self._pause_admission(
-                    self._cooldown_for_terminal_job(job, record, telemetry)
-                )
+                if self._is_high_load_terminal_job(job, record, telemetry):
+                    self._arm_high_load_transition_gate(job_id, record)
+                else:
+                    self._pause_admission(self.config.post_job_cooldown_seconds)
                 terminal_transition = True
                 continue
             if job and job.get("cancel_requested"):
@@ -515,25 +568,133 @@ class Scheduler:
         if record:
             record.log_handle.close()
 
-    def _cooldown_for_terminal_job(
+    def _is_high_load_terminal_job(
         self,
         job: dict | None,
         record: RunningProcess,
         telemetry: GpuTelemetry | None,
-    ) -> float:
+    ) -> bool:
         runtime_seconds = max(0.0, time.monotonic() - record.started_monotonic)
         peak_used_mb = int((job or {}).get("peak_total_gpu_used_mb") or 0)
         if telemetry is not None:
             peak_used_mb = max(peak_used_mb, telemetry.used_mb)
-        high_load = (
+        return (
             runtime_seconds >= self.config.high_load_min_runtime_seconds
             or peak_used_mb >= self.config.high_load_min_peak_used_mb
         )
-        return (
-            self.config.post_high_load_cooldown_seconds
-            if high_load
-            else self.config.post_job_cooldown_seconds
+
+    def _arm_high_load_transition_gate(
+        self, job_id: str, record: RunningProcess
+    ) -> None:
+        not_before = (
+            time.monotonic() + self.config.post_high_load_cooldown_seconds
         )
+        baseline_used_mb = max(0, record.baseline_used_mb)
+        with self.lock:
+            existing = self.high_load_transition_gate
+            if existing is not None:
+                job_ids = tuple(dict.fromkeys((*existing.job_ids, job_id)))
+                not_before = max(not_before, existing.not_before_monotonic)
+                baseline_used_mb = min(
+                    baseline_used_mb, existing.baseline_used_mb
+                )
+            else:
+                job_ids = (job_id,)
+            self.high_load_transition_gate = HighLoadTransitionGate(
+                job_ids=job_ids,
+                not_before_monotonic=not_before,
+                baseline_used_mb=baseline_used_mb,
+                last_process_generation=self.gpu_process_scan_generation,
+            )
+            self.admission_not_before_monotonic = max(
+                self.admission_not_before_monotonic, not_before
+            )
+
+    def _evaluate_high_load_transition_gate(
+        self, telemetry: GpuTelemetry
+    ) -> bool:
+        gate = self.high_load_transition_gate
+        if gate is None:
+            return True
+        now = time.monotonic()
+        if now < gate.not_before_monotonic:
+            gate.stable_samples = 0
+            gate.process_stable_scans = 0
+            gate.reason = "minimum-cooldown"
+            return False
+        if not self.gpu_healthy:
+            gate.stable_samples = 0
+            gate.process_stable_scans = 0
+            gate.reason = "gpu-health-blocked"
+            return False
+        if self.process_scan_error is not None:
+            gate.stable_samples = 0
+            gate.process_stable_scans = 0
+            gate.reason = "gpu-process-scan-error"
+            return False
+
+        process_generation = self.gpu_process_scan_generation
+        if process_generation > gate.last_process_generation:
+            signature = tuple(
+                sorted(
+                    (process.pid, process.process_name)
+                    for process in self.gpu_processes
+                )
+            )
+            if signature == gate.last_process_signature:
+                gate.process_stable_scans += 1
+            else:
+                gate.last_process_signature = signature
+                gate.process_stable_scans = 1
+            gate.last_process_generation = process_generation
+
+        vram_limit_mb = (
+            gate.baseline_used_mb
+            + self.config.post_high_load_vram_tolerance_mb
+        )
+        if telemetry.used_mb > vram_limit_mb:
+            gate.stable_samples = 0
+            gate.reason = (
+                f"vram-not-idle:{telemetry.used_mb}>{vram_limit_mb}MB"
+            )
+            return False
+        if (
+            telemetry.utilization_percent
+            > self.config.post_high_load_max_idle_utilization_percent
+        ):
+            gate.stable_samples = 0
+            gate.reason = (
+                "gpu-not-idle:"
+                f"{telemetry.utilization_percent}>"
+                f"{self.config.post_high_load_max_idle_utilization_percent}%"
+            )
+            return False
+
+        gate.stable_samples += 1
+        if (
+            gate.stable_samples < self.config.post_high_load_stable_samples
+        ):
+            gate.reason = (
+                "telemetry-stabilizing:"
+                f"{gate.stable_samples}/"
+                f"{self.config.post_high_load_stable_samples}"
+            )
+            return False
+        if (
+            gate.process_stable_scans
+            < self.config.post_high_load_process_stable_scans
+        ):
+            gate.reason = (
+                "process-census-stabilizing:"
+                f"{gate.process_stable_scans}/"
+                f"{self.config.post_high_load_process_stable_scans}"
+            )
+            return False
+
+        self.high_load_transition_gate = None
+        self.admission_not_before_monotonic = 0.0
+        self.baseline_used_mb = telemetry.used_mb
+        return True
 
     def _pause_admission(self, seconds: float | None = None) -> None:
         if seconds is None:
@@ -547,6 +708,10 @@ class Scheduler:
         if not self.gpu_healthy:
             with self.lock:
                 self.last_decision = "gpu-health-blocked"
+            return
+        if self.high_load_transition_gate is not None:
+            with self.lock:
+                self.last_decision = "post-high-load-transition"
             return
         cooldown_remaining = self.admission_not_before_monotonic - time.monotonic()
         if cooldown_remaining > 0:
@@ -626,6 +791,7 @@ class Scheduler:
             max_runtime_seconds=job["max_runtime_seconds"],
             workload_key=job["workload_key"],
             argv=tuple(argv),
+            baseline_used_mb=self.baseline_used_mb,
         )
         with self.lock:
             self.running[job["id"]] = record

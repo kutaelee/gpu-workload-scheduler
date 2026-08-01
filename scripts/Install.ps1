@@ -66,6 +66,10 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
         terminate_grace_seconds = 10.0
         post_job_cooldown_seconds = 2.0
         post_high_load_cooldown_seconds = 180.0
+        post_high_load_stable_samples = 10
+        post_high_load_process_stable_scans = 2
+        post_high_load_vram_tolerance_mb = 4096
+        post_high_load_max_idle_utilization_percent = 5
         high_load_min_runtime_seconds = 1800.0
         high_load_min_peak_used_mb = 24576
         gpu_health_recovery_samples = 3

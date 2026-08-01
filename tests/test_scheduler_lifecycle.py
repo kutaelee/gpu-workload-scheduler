@@ -1,7 +1,7 @@
 from io import BytesIO
 from types import SimpleNamespace
 
-from gpuq.gpu import GpuTelemetry
+from gpuq.gpu import GpuProcess, GpuTelemetry
 from gpuq.scheduler import RunningProcess, Scheduler
 
 
@@ -31,11 +31,21 @@ def make_scheduler(monkeypatch, *, wsl_force_terminate=False, cleanup_commands=N
     scheduler.running = {}
     scheduler.last_error = None
     scheduler.admission_not_before_monotonic = 0.0
+    scheduler.high_load_transition_gate = None
+    scheduler.baseline_used_mb = 1000
+    scheduler.gpu_healthy = True
+    scheduler.gpu_processes = []
+    scheduler.process_scan_error = None
+    scheduler.gpu_process_scan_generation = 0
     scheduler.config = SimpleNamespace(
         cancel_grace_seconds=30.0,
         terminate_grace_seconds=10.0,
         post_job_cooldown_seconds=2.0,
         post_high_load_cooldown_seconds=180.0,
+        post_high_load_stable_samples=3,
+        post_high_load_process_stable_scans=2,
+        post_high_load_vram_tolerance_mb=4096,
+        post_high_load_max_idle_utilization_percent=5,
         high_load_min_runtime_seconds=1800.0,
         high_load_min_peak_used_mb=24576,
         gpu_health_recovery_samples=3,
@@ -56,6 +66,7 @@ def make_record(process, argv=("python.exe", "job.py")):
         max_runtime_seconds=600,
         workload_key="training-job",
         argv=argv,
+        baseline_used_mb=1000,
     )
 
 
@@ -145,7 +156,7 @@ def test_terminal_process_is_reaped_without_gpu_telemetry(monkeypatch):
     assert scheduler.running == {}
 
 
-def test_long_job_uses_high_load_cooldown(monkeypatch):
+def test_long_job_arms_stateful_high_load_transition_gate(monkeypatch):
     scheduler, clock = make_scheduler(monkeypatch)
     process = FakeProcess(exit_code=0)
     record = make_record(process)
@@ -163,3 +174,41 @@ def test_long_job_uses_high_load_cooldown(monkeypatch):
     scheduler._reap_and_cancel(GpuTelemetry("GPU", 32000, 1000, 31000, 0))
 
     assert scheduler.admission_not_before_monotonic == 280.0
+    assert scheduler.high_load_transition_gate is not None
+    assert scheduler.high_load_transition_gate.job_ids == ("job-long",)
+
+
+def test_high_load_gate_requires_post_cooldown_telemetry_and_process_stability(
+    monkeypatch,
+):
+    scheduler, clock = make_scheduler(monkeypatch)
+    record = make_record(FakeProcess(exit_code=0))
+    scheduler._arm_high_load_transition_gate("job-long", record)
+    telemetry = GpuTelemetry("GPU", 32000, 2000, 30000, 2)
+
+    assert scheduler._evaluate_high_load_transition_gate(telemetry) is False
+    assert scheduler.high_load_transition_gate.reason == "minimum-cooldown"
+
+    clock.value = 281.0
+    scheduler.gpu_processes = [GpuProcess(42, "comfyui.exe", 1000)]
+    scheduler.gpu_process_scan_generation = 1
+    assert scheduler._evaluate_high_load_transition_gate(telemetry) is False
+
+    scheduler.gpu_process_scan_generation = 2
+    assert scheduler._evaluate_high_load_transition_gate(telemetry) is False
+    assert scheduler._evaluate_high_load_transition_gate(telemetry) is True
+    assert scheduler.high_load_transition_gate is None
+    assert scheduler.baseline_used_mb == 2000
+
+
+def test_high_load_gate_resets_when_vram_is_not_idle(monkeypatch):
+    scheduler, clock = make_scheduler(monkeypatch)
+    record = make_record(FakeProcess(exit_code=0))
+    scheduler._arm_high_load_transition_gate("job-long", record)
+    clock.value = 281.0
+    scheduler.gpu_process_scan_generation = 1
+
+    busy = GpuTelemetry("GPU", 32000, 6000, 26000, 2)
+    assert scheduler._evaluate_high_load_transition_gate(busy) is False
+    assert scheduler.high_load_transition_gate.stable_samples == 0
+    assert scheduler.high_load_transition_gate.reason.startswith("vram-not-idle")
