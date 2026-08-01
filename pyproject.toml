@@ -1,0 +1,12 @@
+[project]
+name = "gpu-workload-scheduler"
+version = "0.1.1"
+description = "Local RTX workstation GPU reservation queue and dashboard"
+requires-python = ">=3.12"
+dependencies = ["psycopg[binary]==3.3.4"]
+
+[project.scripts]
+gpuq = "gpuq.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
