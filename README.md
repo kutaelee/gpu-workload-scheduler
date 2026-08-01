@@ -55,6 +55,13 @@ workload key, never to argv or environment data. Keep them narrow; for example,
 `wedding-*klein9b*qfloat8*` covers the currently isolated Klein 9B qfloat8
 training family without blocking unrelated ComfyUI prompts.
 
+`reboot_boundary_exempt_workloads` is an exact-key diagnostic exception list.
+It overrides a matching boundary pattern only for explicitly reviewed workload
+keys whose trigger path has been removed and whose submission wrapper validates
+the executable configuration and source hashes. Do not use wildcard exemptions;
+keep the legacy failing workload keys protected while same-boot load/unload/reload
+validation is in progress.
+
 GPU telemetry is an admission circuit breaker. Transient query failures back
 off 5, 15, then 60 seconds while process lifecycle reaping continues without
 touching NVIDIA. Exit code 6, `GPU is lost`, or `reboot required` is different:

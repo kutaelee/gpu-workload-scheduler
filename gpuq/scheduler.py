@@ -755,6 +755,8 @@ class Scheduler:
         return terminal_transition
 
     def _requires_reboot_boundary(self, workload_key: str) -> bool:
+        if workload_key in self.config.reboot_boundary_exempt_workloads:
+            return False
         if workload_key in self.config.reboot_boundary_workloads:
             return True
         return any(
