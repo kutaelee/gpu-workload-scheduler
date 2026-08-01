@@ -62,7 +62,9 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
         fairness_window_minutes = 60
         max_parallel_jobs = 1
         gpu_telemetry_enabled = $true
+        probe_gpu_on_startup = $false
         poll_seconds = 2.0
+        active_gpu_probe_interval_seconds = 10.0
         process_scan_interval_seconds = 30.0
         cancel_grace_seconds = 30.0
         terminate_grace_seconds = 10.0

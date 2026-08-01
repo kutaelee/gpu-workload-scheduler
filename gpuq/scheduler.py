@@ -156,6 +156,11 @@ class Scheduler:
             self.last_decision = "workload-reboot-boundary-required"
             self.thread.start()
             return
+        if not getattr(self.config, "probe_gpu_on_startup", False):
+            self.gpu_fault_status = "unprobed"
+            self.last_decision = "startup-no-gpu-probe"
+            self.thread.start()
+            return
         try:
             telemetry = read_gpu()
         except Exception as exc:
@@ -326,6 +331,31 @@ class Scheduler:
                 self.stop_event.wait(self.config.poll_seconds)
                 continue
 
+            # An idle scheduler must not continuously exercise NVML/nvidia-smi.
+            # Query PostgreSQL first and touch the NVIDIA stack only for an
+            # admission request, an active managed process, or a post-job gate.
+            try:
+                active_rows = self.database.active_jobs()
+                queued_rows = self.database.queue_candidates(
+                    self.config.fairness_window_minutes
+                )
+            except Exception as exc:
+                with self.lock:
+                    self.last_error = f"{type(exc).__name__}: {exc}"[:1000]
+                    self.last_decision = "gpu-demand-check-failed-no-probe"
+                self.stop_event.wait(self.config.poll_seconds)
+                continue
+            if (
+                not active_rows
+                and not queued_rows
+                and self.high_load_transition_gate is None
+            ):
+                with self.lock:
+                    self.last_decision = "idle-no-gpu-probe"
+                self.database.set_state("runtime", self.snapshot())
+                self.stop_event.wait(self.config.poll_seconds)
+                continue
+
             try:
                 telemetry = read_gpu()
             except Exception as exc:
@@ -355,7 +385,6 @@ class Scheduler:
                         )
                     )
                     self._refresh_external_workloads()
-                active_rows = self.database.active_jobs()
                 if not active_rows and self.high_load_transition_gate is None:
                     self.baseline_used_mb = telemetry.used_mb
                 if terminal_transition:
@@ -389,6 +418,11 @@ class Scheduler:
                     if recovered:
                         self._pause_admission()
                     self._schedule_once(telemetry, active_rows)
+                    if self.running:
+                        self.next_gpu_probe_monotonic = (
+                            time.monotonic()
+                            + self.config.active_gpu_probe_interval_seconds
+                        )
                 self.database.set_state("runtime", self.snapshot())
             except Exception as exc:
                 with self.lock:

@@ -22,7 +22,9 @@ class Config:
     fairness_window_minutes: int
     max_parallel_jobs: int
     gpu_telemetry_enabled: bool
+    probe_gpu_on_startup: bool
     poll_seconds: float
+    active_gpu_probe_interval_seconds: float
     process_scan_interval_seconds: float
     cancel_grace_seconds: float
     terminate_grace_seconds: float
@@ -128,7 +130,12 @@ class Config:
             fairness_window_minutes=int(raw.get("fairness_window_minutes", 60)),
             max_parallel_jobs=max(1, int(raw.get("max_parallel_jobs", 1))),
             gpu_telemetry_enabled=bool(raw.get("gpu_telemetry_enabled", True)),
+            probe_gpu_on_startup=bool(raw.get("probe_gpu_on_startup", False)),
             poll_seconds=float(raw.get("poll_seconds", 2.0)),
+            active_gpu_probe_interval_seconds=max(
+                5.0,
+                float(raw.get("active_gpu_probe_interval_seconds", 10.0)),
+            ),
             process_scan_interval_seconds=max(
                 30.0, float(raw.get("process_scan_interval_seconds", 30.0))
             ),
