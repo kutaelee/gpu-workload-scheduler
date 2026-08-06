@@ -35,17 +35,21 @@ function Test-LocalPort([int]$Port) {
 }
 
 function Wait-ForDocker {
-    for ($attempt = 1; $attempt -le 90; $attempt++) {
+    $attempt = 0
+    while ($true) {
+        $attempt++
         & $env:ComSpec /d /c 'docker info >nul 2>&1'
         if ($LASTEXITCODE -eq 0) {
+            if ($attempt -gt 1) {
+                Write-StartupLog "Docker Desktop became ready after $attempt attempts."
+            }
             return $true
         }
         if ($attempt -eq 1 -or $attempt % 6 -eq 0) {
-            Write-StartupLog "Waiting for Docker Desktop (attempt $attempt/90)."
+            Write-StartupLog "Waiting for Docker Desktop (attempt $attempt; no startup deadline)."
         }
         Start-Sleep -Seconds 10
     }
-    return $false
 }
 
 function Ensure-DatabaseReachable([int]$Port) {
@@ -84,10 +88,7 @@ function Ensure-DatabaseReachable([int]$Port) {
     return $false
 }
 
-if (-not (Wait-ForDocker)) {
-    Write-StartupLog 'Docker Desktop did not become ready within 15 minutes.'
-    exit 10
-}
+[void](Wait-ForDocker)
 
 # The scheduled task owns this supervisor. It keeps the API recoverable after
 # transient DB/Docker failures instead of consuming its finite Task Scheduler
